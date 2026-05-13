@@ -663,9 +663,22 @@ fn build_vm(
 
         if let Some((tag, path)) = spec.split_once(':') {
             let tag = tag.to_string();
+            // `strict` makes PassthroughFs::build() probe xattr support
+            // by writing `setxattr user.containers._probe` on the source
+            // directory. Linux requires the caller to own the file (or
+            // hold CAP_SYS_ADMIN) to write a `user.*` xattr, so binding
+            // any directory the user doesn't own — /tmp, /var, /etc,
+            // foreign-owned dirs — fails up front with EPERM. The OCI
+            // rootfs path keeps strict because msb owns the rootfs it
+            // builds; user bind mounts are different.
+            //
+            // `xattr` stays true so opportunistic per-file stat
+            // virtualization remains available for callers who set the
+            // override xattrs.
             let cfg = PassthroughConfig {
                 root_dir: PathBuf::from(path),
                 inject_init: false,
+                strict: false,
                 ..Default::default()
             };
             let backend = PassthroughFs::new(cfg)
