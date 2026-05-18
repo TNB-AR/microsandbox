@@ -5,9 +5,10 @@
 //! contents of `crate::config::GlobalConfig` and `crate::db::init_global`
 //! into this struct's fields as each call site is converted.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
-use super::{Backend, BackendKind, SandboxBackend};
+use super::{Backend, BackendKind, SandboxBackend, VolumeBackend};
 
 //--------------------------------------------------------------------------------------------------
 // Types
@@ -40,6 +41,16 @@ impl LocalBackend {
     pub fn lazy() -> Self {
         Self {}
     }
+
+    /// Host-side directory rooted at `volumes_dir/<name>` for a named volume.
+    ///
+    /// Non-trait helper used by [`VolumeFs`](crate::volume::VolumeFs) streaming
+    /// methods and the local-FFI shims that need a path before any backend
+    /// trait call. Reads from the process-wide config singleton today;
+    /// absorbs into [`LocalBackend`] fields when the globals are hoisted.
+    pub fn volume_path(&self, name: &str) -> PathBuf {
+        crate::config::config().volumes_dir().join(name)
+    }
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -52,6 +63,10 @@ impl Backend for LocalBackend {
     }
 
     fn sandboxes(&self) -> &dyn SandboxBackend {
+        self
+    }
+
+    fn volumes(&self) -> &dyn VolumeBackend {
         self
     }
 }

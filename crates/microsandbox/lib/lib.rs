@@ -31,8 +31,10 @@ pub use backend::{
     CloudErrorBody, CloudMessageResponse, CloudPaginated, CloudSandbox, CloudSandboxStatus,
     LocalBackend, Profile, ProfileBackend, SandboxBackend, SandboxCloudState,
     SandboxHandleCloudState, SandboxHandleInner, SandboxHandleLocalState, SandboxInner,
-    SandboxList, SandboxLocalState, SdkConfig, default_backend, load_sdk_config,
-    resolve_default_backend, set_default_backend, with_backend,
+    SandboxList, SandboxLocalState, SdkConfig, VolumeBackend, VolumeCloudState,
+    VolumeHandleCloudState, VolumeHandleInner, VolumeHandleLocalState, VolumeInner,
+    VolumeLocalState, default_backend, load_sdk_config, resolve_default_backend,
+    set_default_backend, with_backend,
 };
 pub use config::set_sdk_libkrunfw_path as set_libkrunfw_path;
 pub use error::*;
@@ -57,4 +59,4 @@ pub use snapshot::{
     Snapshot, SnapshotBuilder, SnapshotConfig, SnapshotDestination, SnapshotFormat, SnapshotHandle,
     SnapshotVerifyReport, UpperIntegrity, UpperVerifyStatus,
 };
-pub use volume::Volume;
+pub use volume::{Volume, VolumeHandle};

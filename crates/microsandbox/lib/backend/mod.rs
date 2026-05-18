@@ -24,6 +24,7 @@ mod cloud_wire;
 mod local;
 mod profile;
 pub(crate) mod sandbox;
+pub(crate) mod volume;
 
 pub use cloud::{CloudBackend, CloudBackendBuilder};
 pub use cloud_wire::{
@@ -35,6 +36,10 @@ pub use profile::{Profile, ProfileBackend, SdkConfig, load_sdk_config, resolve_d
 pub use sandbox::{
     SandboxBackend, SandboxCloudState, SandboxHandleCloudState, SandboxHandleInner,
     SandboxHandleLocalState, SandboxInner, SandboxList, SandboxLocalState,
+};
+pub use volume::{
+    VolumeBackend, VolumeCloudState, VolumeHandleCloudState, VolumeHandleInner,
+    VolumeHandleLocalState, VolumeInner, VolumeLocalState,
 };
 
 use std::sync::{Arc, OnceLock, RwLock};
@@ -66,6 +71,9 @@ pub trait Backend: Send + Sync + 'static {
 
     /// Return the sandbox lifecycle backend.
     fn sandboxes(&self) -> &dyn SandboxBackend;
+
+    /// Return the volume lifecycle backend.
+    fn volumes(&self) -> &dyn VolumeBackend;
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -169,6 +177,10 @@ mod tests {
             }
 
             fn sandboxes(&self) -> &dyn SandboxBackend {
+                unimplemented!("fake backend only tests kind routing")
+            }
+
+            fn volumes(&self) -> &dyn VolumeBackend {
                 unimplemented!("fake backend only tests kind routing")
             }
         }

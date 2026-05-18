@@ -17,7 +17,7 @@ use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue, USER_AGENT};
 use super::cloud_wire::{
     CloudCreateSandboxRequest, CloudErrorBody, CloudMessageResponse, CloudPaginated, CloudSandbox,
 };
-use super::{Backend, BackendKind, SandboxBackend};
+use super::{Backend, BackendKind, SandboxBackend, VolumeBackend};
 use crate::{MicrosandboxError, MicrosandboxResult};
 
 //--------------------------------------------------------------------------------------------------
@@ -451,6 +451,10 @@ impl Backend for CloudBackend {
     }
 
     fn sandboxes(&self) -> &dyn SandboxBackend {
+        self
+    }
+
+    fn volumes(&self) -> &dyn VolumeBackend {
         self
     }
 }
