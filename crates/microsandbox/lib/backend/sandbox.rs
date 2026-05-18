@@ -407,11 +407,13 @@ impl SandboxBackend for CloudBackend {
 
 /// Map [`CloudSandboxStatus`] to the SDK's [`SandboxStatus`] enum.
 ///
-/// `Created` and `Starting` both collapse to `Stopped` (the sandbox is not
-/// running yet); `Stopping` collapses to `Draining`; `Failed` to `Crashed`.
+/// `Stopping` collapses to `Draining` (microsandbox uses `Draining` for
+/// the graceful-stop state); `Failed` collapses to `Crashed`. All other
+/// variants map 1:1.
 pub(crate) fn cloud_status_to_sandbox_status(s: CloudSandboxStatus) -> SandboxStatus {
     match s {
-        CloudSandboxStatus::Created | CloudSandboxStatus::Starting => SandboxStatus::Stopped,
+        CloudSandboxStatus::Created => SandboxStatus::Created,
+        CloudSandboxStatus::Starting => SandboxStatus::Starting,
         CloudSandboxStatus::Running => SandboxStatus::Running,
         CloudSandboxStatus::Stopping => SandboxStatus::Draining,
         CloudSandboxStatus::Stopped => SandboxStatus::Stopped,
@@ -465,6 +467,54 @@ pub(super) fn cloud_create_request_from_config(
         "cmd",
         "when cmd lands on the cloud API",
     )?;
+    reject_cloud_deferred(
+        config.replace_existing,
+        ".replace()",
+        "when cloud sandbox replace semantics land",
+    )?;
+    reject_cloud_deferred(
+        config.init.is_some(),
+        "init",
+        "when cloud init wrapper lands",
+    )?;
+    reject_cloud_deferred(
+        config.pull_policy != microsandbox_image::PullPolicy::IfMissing,
+        "pull_policy",
+        "when cloud pull policy lands",
+    )?;
+    reject_cloud_deferred(
+        config.registry_auth.is_some(),
+        "registry_auth",
+        "when cloud registry auth lands",
+    )?;
+    reject_cloud_deferred(
+        config.insecure,
+        "insecure registries",
+        "when cloud insecure-registry support lands",
+    )?;
+    reject_cloud_deferred(
+        !config.ca_certs.is_empty(),
+        "ca_certs",
+        "when cloud custom CA certs land",
+    )?;
+    #[cfg(feature = "net")]
+    {
+        // Only flag user-set opt-in fields. The default `NetworkConfig`
+        // ships with a baseline policy (`public_only`) and built-in DNS
+        // settings, so comparing those would always trigger; instead we
+        // catch the explicit-add fields (ports, secrets, custom DNS
+        // resolvers, host-CA trust).
+        let net = &config.network;
+        let has_custom_network = !net.ports.is_empty()
+            || !net.secrets.secrets.is_empty()
+            || !net.dns.nameservers.is_empty()
+            || net.trust_host_cas;
+        reject_cloud_deferred(
+            has_custom_network,
+            "network policy / ports / secrets",
+            "when cloud networking ships",
+        )?;
+    }
 
     let image = match config.image {
         RootfsSource::Oci(image) => image,
@@ -579,5 +629,118 @@ mod tests {
 
         let err = cloud_create_request_from_config(config).unwrap_err();
         assert!(matches!(err, MicrosandboxError::Unsupported { .. }));
+    }
+
+    /// Build a minimal OCI-backed [`SandboxConfig`] suitable for the
+    /// cloud-reject tests. Each test then mutates one field and asserts
+    /// the resulting request errors with `Unsupported`.
+    fn base_cloud_config() -> SandboxConfig {
+        SandboxConfig {
+            name: "agent-1".into(),
+            image: RootfsSource::Oci("python:3.12".into()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn cloud_create_request_rejects_replace_existing() {
+        let mut config = base_cloud_config();
+        config.replace_existing = true;
+        let err = cloud_create_request_from_config(config).unwrap_err();
+        assert!(matches!(err, MicrosandboxError::Unsupported { .. }));
+    }
+
+    #[test]
+    fn cloud_create_request_rejects_init() {
+        let mut config = base_cloud_config();
+        config.init = Some(crate::sandbox::HandoffInit {
+            cmd: "/sbin/init".into(),
+            args: Vec::new(),
+            env: Vec::new(),
+        });
+        let err = cloud_create_request_from_config(config).unwrap_err();
+        assert!(matches!(err, MicrosandboxError::Unsupported { .. }));
+    }
+
+    #[test]
+    fn cloud_create_request_rejects_non_default_pull_policy() {
+        let mut config = base_cloud_config();
+        config.pull_policy = microsandbox_image::PullPolicy::Always;
+        let err = cloud_create_request_from_config(config).unwrap_err();
+        assert!(matches!(err, MicrosandboxError::Unsupported { .. }));
+    }
+
+    #[test]
+    fn cloud_create_request_rejects_registry_auth() {
+        let mut config = base_cloud_config();
+        config.registry_auth = Some(microsandbox_image::RegistryAuth::Basic {
+            username: "u".into(),
+            password: "p".into(),
+        });
+        let err = cloud_create_request_from_config(config).unwrap_err();
+        assert!(matches!(err, MicrosandboxError::Unsupported { .. }));
+    }
+
+    #[test]
+    fn cloud_create_request_rejects_insecure() {
+        let mut config = base_cloud_config();
+        config.insecure = true;
+        let err = cloud_create_request_from_config(config).unwrap_err();
+        assert!(matches!(err, MicrosandboxError::Unsupported { .. }));
+    }
+
+    #[test]
+    fn cloud_create_request_rejects_ca_certs() {
+        let mut config = base_cloud_config();
+        config
+            .ca_certs
+            .push(b"-----BEGIN CERTIFICATE-----\nfake\n-----END CERTIFICATE-----".to_vec());
+        let err = cloud_create_request_from_config(config).unwrap_err();
+        assert!(matches!(err, MicrosandboxError::Unsupported { .. }));
+    }
+
+    #[cfg(feature = "net")]
+    #[test]
+    fn cloud_create_request_rejects_published_ports() {
+        let mut config = base_cloud_config();
+        config
+            .network
+            .ports
+            .push(microsandbox_network::config::PublishedPort {
+                host_port: 8080,
+                guest_port: 80,
+                protocol: microsandbox_network::config::PortProtocol::Tcp,
+                host_bind: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            });
+        let err = cloud_create_request_from_config(config).unwrap_err();
+        assert!(matches!(err, MicrosandboxError::Unsupported { .. }));
+    }
+
+    #[test]
+    fn cloud_status_maps_created_and_starting_one_to_one() {
+        assert_eq!(
+            cloud_status_to_sandbox_status(CloudSandboxStatus::Created),
+            SandboxStatus::Created,
+        );
+        assert_eq!(
+            cloud_status_to_sandbox_status(CloudSandboxStatus::Starting),
+            SandboxStatus::Starting,
+        );
+        assert_eq!(
+            cloud_status_to_sandbox_status(CloudSandboxStatus::Running),
+            SandboxStatus::Running,
+        );
+        assert_eq!(
+            cloud_status_to_sandbox_status(CloudSandboxStatus::Stopping),
+            SandboxStatus::Draining,
+        );
+        assert_eq!(
+            cloud_status_to_sandbox_status(CloudSandboxStatus::Stopped),
+            SandboxStatus::Stopped,
+        );
+        assert_eq!(
+            cloud_status_to_sandbox_status(CloudSandboxStatus::Failed),
+            SandboxStatus::Crashed,
+        );
     }
 }

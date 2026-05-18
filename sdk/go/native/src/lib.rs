@@ -1866,6 +1866,8 @@ pub unsafe extern "C" fn msb_sandbox_create(
 fn sandbox_status_str(s: microsandbox::sandbox::SandboxStatus) -> &'static str {
     use microsandbox::sandbox::SandboxStatus::*;
     match s {
+        Created => "created",
+        Starting => "starting",
         Running => "running",
         Draining => "draining",
         Paused => "paused",

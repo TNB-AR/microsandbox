@@ -95,7 +95,7 @@ pub async fn resolve_and_start(name: &str, quiet: bool) -> anyhow::Result<Sandbo
                 }
             }
         }
-        SandboxStatus::Paused => {
+        SandboxStatus::Created | SandboxStatus::Starting | SandboxStatus::Paused => {
             anyhow::bail!(
                 "sandbox '{}' is in state {:?} and cannot be started",
                 name,
