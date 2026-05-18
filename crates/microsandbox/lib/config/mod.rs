@@ -287,6 +287,7 @@ struct KeyringRegistryCredential {
 
 static CONFIG: OnceLock<GlobalConfig> = OnceLock::new();
 static SDK_MSB_PATH: OnceLock<PathBuf> = OnceLock::new();
+static SDK_LIBKRUNFW_PATH: OnceLock<PathBuf> = OnceLock::new();
 
 impl GlobalConfig {
     /// Get the resolved home directory.
@@ -624,6 +625,12 @@ pub fn config() -> &'static GlobalConfig {
 
 /// Resolve the path to the persisted global config file.
 pub fn config_path() -> PathBuf {
+    // Honour MSB_CONFIG_PATH if set (D6.7) — same env var the SDK config loader
+    // checks. The GlobalConfig and the new SdkConfig live in the same JSON
+    // document, so both layers must agree on the path.
+    if let Ok(p) = std::env::var("MSB_CONFIG_PATH") {
+        return PathBuf::from(p);
+    }
     resolve_default_home().join(microsandbox_utils::CONFIG_FILENAME)
 }
 
@@ -793,14 +800,48 @@ fn resolve_msb_path_from(
     ))
 }
 
+/// Set the `libkrunfw` path resolved by an SDK package (e.g. one that ships a
+/// bundled libkrunfw dylib inside its language-package wheel/npm-package).
+///
+/// Set-once: subsequent calls are ignored. Sits at tier 2 of
+/// [`resolve_libkrunfw_path`] — below user env (`MSB_LIBKRUNFW_PATH`) so a user
+/// override always wins, above the global config + filesystem fallbacks.
+///
+/// Mirrors [`set_sdk_msb_path`]; both share the same precedence shape.
+pub fn set_sdk_libkrunfw_path(path: impl Into<PathBuf>) {
+    let _ = SDK_LIBKRUNFW_PATH.set(path.into());
+}
+
 /// Resolve the path to `libkrunfw`.
 ///
-/// Resolution order:
-/// 1. `config().paths.libkrunfw`
-/// 2. A sibling of the resolved `msb` binary (for `build/msb`)
-/// 3. `../lib/` next to the resolved `msb` binary (for installed layouts)
-/// 4. `{home}/lib/libkrunfw.{so,dylib}`
+/// Resolution order (highest first):
+/// 1. `MSB_LIBKRUNFW_PATH` environment variable (user-facing override).
+/// 2. SDK-provided runtime path (set via [`set_sdk_libkrunfw_path`], used by
+///    FFI bindings that ship a bundled dylib).
+/// 3. `config().paths.libkrunfw`.
+/// 4. A sibling of the resolved `msb` binary (for `build/msb`).
+/// 5. `../lib/` next to the resolved `msb` binary (for installed layouts).
+/// 6. `{home}/lib/libkrunfw.{so,dylib}`.
 pub fn resolve_libkrunfw_path() -> MicrosandboxResult<PathBuf> {
+    if let Ok(env_path) = std::env::var("MSB_LIBKRUNFW_PATH") {
+        let path = PathBuf::from(env_path);
+        if path.is_file() {
+            tracing::debug!(path = %path.display(), source = "MSB_LIBKRUNFW_PATH env", "resolved libkrunfw");
+            return Ok(path);
+        }
+        return Err(MicrosandboxError::LibkrunfwNotFound(format!(
+            "MSB_LIBKRUNFW_PATH points to non-file: {}",
+            path.display()
+        )));
+    }
+    if let Some(sdk_path) = SDK_LIBKRUNFW_PATH.get() {
+        if sdk_path.is_file() {
+            tracing::debug!(path = %sdk_path.display(), source = "SDK runtime path", "resolved libkrunfw");
+            return Ok(sdk_path.clone());
+        }
+        // SDK path set but missing — fall through to config + fallbacks rather than error.
+        tracing::warn!(path = %sdk_path.display(), "SDK_LIBKRUNFW_PATH points to non-file; falling through to config + filesystem fallbacks");
+    }
     if let Some(path) = &config().paths.libkrunfw {
         if path.is_file() {
             return Ok(path.clone());

@@ -1,0 +1,565 @@
+//! Cloud backend implementation — talks to an msb-cloud control plane over HTTP.
+//!
+//! Holds the (url, api_key) tuple and a `reqwest::Client`. Sub-trait
+//! implementations (sandbox lifecycle, exec, volumes, …) land alongside the
+//! `Backend` trait's sub-trait surface as that surface is filled in.
+//!
+//! See `msb-cloud/plans/sdk-cloud-parity-plan.md` D6.3 for the construction
+//! contract (URL + API key first; profile and env are sugar) and D10 for the
+//! API-key-only auth surface.
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use reqwest::Response;
+use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue, USER_AGENT};
+
+use super::cloud_wire::{
+    CloudCreateSandboxRequest, CloudErrorBody, CloudMessageResponse, CloudPaginated, CloudSandbox,
+};
+use super::{Backend, BackendKind, SandboxBackend};
+use crate::{MicrosandboxError, MicrosandboxResult};
+
+//--------------------------------------------------------------------------------------------------
+// Constants
+//--------------------------------------------------------------------------------------------------
+
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Default User-Agent header value.
+fn default_user_agent() -> String {
+    format!("microsandbox-sdk/{}", env!("CARGO_PKG_VERSION"))
+}
+
+//--------------------------------------------------------------------------------------------------
+// Types
+//--------------------------------------------------------------------------------------------------
+
+/// Cloud-runtime backend: talks to an msb-cloud control plane over HTTP.
+///
+/// Holds the deployment URL and API key (the (url, api_key) pair determines
+/// which org's view the backend sees — see D8: msb-cloud derives the org from
+/// the API key, no per-call org argument).
+///
+/// Constructors:
+/// - [`CloudBackend::new`] — primary; explicit URL + key. Works for hosted SaaS,
+///   self-hosted, and on-prem deployments identically.
+/// - [`CloudBackend::from_env`] — reads `MSB_API_URL` + `MSB_API_KEY`.
+/// - [`CloudBackend::from_profile`] — reads a named profile from the SDK config.
+/// - [`CloudBackend::builder`] — tuned construction (custom client, timeout,
+///   user agent).
+pub struct CloudBackend {
+    url: String,
+    #[allow(dead_code)] // referenced by HTTP layer + future sub-trait impls
+    api_key: String,
+    http: reqwest::Client,
+}
+
+/// Fluent builder for `CloudBackend`. Use for tuned construction.
+///
+/// ```ignore
+/// let cloud = CloudBackend::builder()
+///     .url("https://msb.example.com")
+///     .api_key(key)
+///     .request_timeout(Duration::from_secs(60))
+///     .build()?;
+/// ```
+pub struct CloudBackendBuilder {
+    url: Option<String>,
+    api_key: Option<String>,
+    request_timeout: Duration,
+    user_agent: Option<String>,
+    custom_client: Option<reqwest::Client>,
+}
+
+//--------------------------------------------------------------------------------------------------
+// Methods: CloudBackend
+//--------------------------------------------------------------------------------------------------
+
+impl CloudBackend {
+    /// Construct a `CloudBackend` with an explicit URL and API key.
+    ///
+    /// Primary constructor. Works identically for hosted msb-cloud, self-hosted
+    /// deployments, and on-prem installs — no constructor implies a specific
+    /// deployment shape.
+    pub fn new(url: impl Into<String>, api_key: impl Into<String>) -> MicrosandboxResult<Self> {
+        Self::builder().url(url).api_key(api_key).build()
+    }
+
+    /// Construct from `MSB_API_URL` + `MSB_API_KEY` env vars.
+    ///
+    /// Returns `InvalidConfig` if either is missing or empty.
+    pub fn from_env() -> MicrosandboxResult<Self> {
+        let url = std::env::var("MSB_API_URL").map_err(|_| {
+            MicrosandboxError::InvalidConfig(
+                "MSB_API_URL not set — required for cloud backend".into(),
+            )
+        })?;
+        let api_key = std::env::var("MSB_API_KEY").map_err(|_| {
+            MicrosandboxError::InvalidConfig(
+                "MSB_API_KEY not set — required for cloud backend".into(),
+            )
+        })?;
+        Self::new(url.trim(), api_key.trim())
+    }
+
+    /// Construct from a named SDK profile in `~/.microsandbox/config.json`.
+    ///
+    /// Profiles are local SDK sugar over the primary `(url, api_key)` constructor;
+    /// msb-cloud does not receive or interpret profile names.
+    pub fn from_profile(name: &str) -> MicrosandboxResult<Self> {
+        super::profile::cloud_backend_from_profile(name)
+    }
+
+    /// Start building a `CloudBackend` with custom options. Call `.build()` when done.
+    pub fn builder() -> CloudBackendBuilder {
+        CloudBackendBuilder::default()
+    }
+
+    /// Configured msb-cloud endpoint URL (no trailing slash).
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+}
+
+//--------------------------------------------------------------------------------------------------
+// Methods: Sandbox lifecycle (Phase 4 MVP)
+//
+// HTTP dispatch for the SDK's sandbox lifecycle ops, hitting msb-cloud's
+// API-key-authenticated routes (`/v1/sandboxes/*` and `/v1/sandboxes/by-name/*`
+// — the latter exists per D7 / Phase 3.5).
+//--------------------------------------------------------------------------------------------------
+
+impl CloudBackend {
+    /// `POST /v1/sandboxes` (optionally `?start=true`).
+    ///
+    /// Pass `start=true` to atomically create-and-start in a single round-trip
+    /// — mirrors the `POST /v1/sandboxes?start=true` shorthand on msb-cloud.
+    pub async fn create_sandbox(
+        &self,
+        req: &CloudCreateSandboxRequest,
+        start: bool,
+    ) -> MicrosandboxResult<CloudSandbox> {
+        let path = if start {
+            "/v1/sandboxes?start=true"
+        } else {
+            "/v1/sandboxes"
+        };
+        let url = format!("{}{}", self.url, path);
+        let resp = self
+            .http
+            .post(&url)
+            .json(req)
+            .send()
+            .await
+            .map_err(|e| cloud_io_error("POST /v1/sandboxes", e))?;
+        decode_json(resp, "POST /v1/sandboxes").await
+    }
+
+    /// `GET /v1/sandboxes` — paginated.
+    pub async fn list_sandboxes(
+        &self,
+        cursor: Option<&str>,
+        limit: Option<u32>,
+    ) -> MicrosandboxResult<CloudPaginated<CloudSandbox>> {
+        let mut url = format!("{}/v1/sandboxes", self.url);
+        let mut query = Vec::new();
+        if let Some(c) = cursor {
+            query.push(format!("cursor={}", urlencoding(c)));
+        }
+        if let Some(l) = limit {
+            query.push(format!("limit={l}"));
+        }
+        if !query.is_empty() {
+            url.push('?');
+            url.push_str(&query.join("&"));
+        }
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| cloud_io_error("GET /v1/sandboxes", e))?;
+        decode_json(resp, "GET /v1/sandboxes").await
+    }
+
+    /// `GET /v1/sandboxes/by-name/:name`.
+    pub async fn get_sandbox(&self, name: &str) -> MicrosandboxResult<CloudSandbox> {
+        let url = format!("{}/v1/sandboxes/by-name/{}", self.url, urlencoding(name));
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| cloud_io_error("GET /v1/sandboxes/by-name/:name", e))?;
+        decode_json(resp, "GET /v1/sandboxes/by-name/:name").await
+    }
+
+    /// `POST /v1/sandboxes/by-name/:name/start`.
+    pub async fn start_sandbox(&self, name: &str) -> MicrosandboxResult<CloudSandbox> {
+        let url = format!(
+            "{}/v1/sandboxes/by-name/{}/start",
+            self.url,
+            urlencoding(name)
+        );
+        let resp = self
+            .http
+            .post(&url)
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .map_err(|e| cloud_io_error("POST start", e))?;
+        decode_json(resp, "POST /v1/sandboxes/by-name/:name/start").await
+    }
+
+    /// `POST /v1/sandboxes/by-name/:name/stop`.
+    pub async fn stop_sandbox(&self, name: &str) -> MicrosandboxResult<CloudSandbox> {
+        let url = format!(
+            "{}/v1/sandboxes/by-name/{}/stop",
+            self.url,
+            urlencoding(name)
+        );
+        let resp = self
+            .http
+            .post(&url)
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .map_err(|e| cloud_io_error("POST stop", e))?;
+        decode_json(resp, "POST /v1/sandboxes/by-name/:name/stop").await
+    }
+
+    /// `DELETE /v1/sandboxes/by-name/:name`. Returns the typed `MessageResponse`
+    /// msb-cloud emits.
+    pub async fn destroy_sandbox(&self, name: &str) -> MicrosandboxResult<CloudMessageResponse> {
+        let url = format!("{}/v1/sandboxes/by-name/{}", self.url, urlencoding(name));
+        let resp = self
+            .http
+            .delete(&url)
+            .send()
+            .await
+            .map_err(|e| cloud_io_error("DELETE /v1/sandboxes/by-name/:name", e))?;
+        decode_json(resp, "DELETE /v1/sandboxes/by-name/:name").await
+    }
+}
+
+//--------------------------------------------------------------------------------------------------
+// Functions: HTTP helpers
+//--------------------------------------------------------------------------------------------------
+
+/// Parse a JSON response into `T`, mapping HTTP errors to typed
+/// `MicrosandboxError` variants. Tries to decode msb-cloud's typed error body
+/// for richer messages on 4xx/5xx.
+async fn decode_json<T: serde::de::DeserializeOwned>(
+    resp: Response,
+    op: &str,
+) -> MicrosandboxResult<T> {
+    let status = resp.status();
+    if status.is_success() {
+        return resp
+            .json::<T>()
+            .await
+            .map_err(|e| MicrosandboxError::Custom(format!("{op}: failed to decode body: {e}")));
+    }
+    let body_text = resp.text().await.unwrap_or_default();
+    let typed: Option<CloudErrorBody> = serde_json::from_str(&body_text).ok();
+    Err(cloud_http_error(
+        status.as_u16(),
+        typed.as_ref(),
+        &body_text,
+        op,
+    ))
+}
+
+fn cloud_io_error(op: &str, e: reqwest::Error) -> MicrosandboxError {
+    tracing::debug!(operation = op, error = %e, "cloud backend transport error");
+    MicrosandboxError::Http(e)
+}
+
+fn cloud_http_error(
+    status: u16,
+    body: Option<&CloudErrorBody>,
+    raw_body: &str,
+    op: &str,
+) -> MicrosandboxError {
+    let code = cloud_error_code(body).map(ToOwned::to_owned);
+    let summary = cloud_error_message(body)
+        .or_else(|| (!raw_body.trim().is_empty()).then_some(raw_body.trim()))
+        .unwrap_or("no response body");
+    let message = format!("{op}: {summary}");
+
+    match code.as_deref() {
+        Some("sandbox_not_found") => return MicrosandboxError::SandboxNotFound(message),
+        Some("name_already_exists") => return MicrosandboxError::SandboxAlreadyExists(message),
+        Some("invalid_request") | Some("invalid_sandbox_config") => {
+            return MicrosandboxError::InvalidConfig(message);
+        }
+        Some("orchestrator_unreachable") | Some("nomad_job_failed") => {
+            return MicrosandboxError::Runtime(message);
+        }
+        _ => {}
+    }
+
+    match status {
+        400 | 422 => MicrosandboxError::InvalidConfig(message),
+        404 => MicrosandboxError::SandboxNotFound(message),
+        409 if op == "POST /v1/sandboxes" => MicrosandboxError::SandboxAlreadyExists(message),
+        502 => MicrosandboxError::Runtime(message),
+        _ => MicrosandboxError::CloudHttp {
+            status,
+            code,
+            message,
+        },
+    }
+}
+
+fn cloud_error_code(body: Option<&CloudErrorBody>) -> Option<&str> {
+    body.and_then(|body| {
+        body.error
+            .as_ref()
+            .and_then(|err| err.code.as_deref())
+            .or(body.code.as_deref())
+    })
+}
+
+fn cloud_error_message(body: Option<&CloudErrorBody>) -> Option<&str> {
+    body.and_then(|body| {
+        body.error
+            .as_ref()
+            .and_then(|err| err.message.as_deref())
+            .or(body.message.as_deref())
+    })
+}
+
+/// Minimal percent-encoding for path segments. Avoids pulling in another crate
+/// for one call site. Encodes characters outside the unreserved set per RFC
+/// 3986 (`ALPHA / DIGIT / "-" / "." / "_" / "~"`).
+fn urlencoding(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.as_bytes() {
+        match *b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(*b as char);
+            }
+            other => out.push_str(&format!("%{other:02X}")),
+        }
+    }
+    out
+}
+
+//--------------------------------------------------------------------------------------------------
+// Methods: CloudBackendBuilder
+//--------------------------------------------------------------------------------------------------
+
+impl CloudBackendBuilder {
+    /// Set the msb-cloud endpoint URL.
+    pub fn url(mut self, url: impl Into<String>) -> Self {
+        self.url = Some(url.into());
+        self
+    }
+
+    /// Set the API key (`msb_live_...` / `msb_test_...`).
+    pub fn api_key(mut self, key: impl Into<String>) -> Self {
+        self.api_key = Some(key.into());
+        self
+    }
+
+    /// Set the per-request timeout for outbound HTTP calls.
+    pub fn request_timeout(mut self, timeout: Duration) -> Self {
+        self.request_timeout = timeout;
+        self
+    }
+
+    /// Override the default `User-Agent` header value.
+    pub fn user_agent(mut self, ua: impl Into<String>) -> Self {
+        self.user_agent = Some(ua.into());
+        self
+    }
+
+    /// Provide a fully custom `reqwest::Client`. When set, `request_timeout`
+    /// and `user_agent` builder options are ignored — the supplied client owns
+    /// its own configuration.
+    pub fn client(mut self, client: reqwest::Client) -> Self {
+        self.custom_client = Some(client);
+        self
+    }
+
+    /// Build the `CloudBackend`. Errors when URL or API key are missing, or
+    /// when the underlying HTTP client fails to construct.
+    pub fn build(self) -> MicrosandboxResult<CloudBackend> {
+        let url = self.url.ok_or_else(|| {
+            MicrosandboxError::InvalidConfig("CloudBackend requires a URL (call .url(...))".into())
+        })?;
+        let url = url.trim();
+        if url.is_empty() {
+            return Err(MicrosandboxError::InvalidConfig(
+                "CloudBackend URL must not be empty".into(),
+            ));
+        }
+        let api_key = self.api_key.ok_or_else(|| {
+            MicrosandboxError::InvalidConfig(
+                "CloudBackend requires an API key (call .api_key(...))".into(),
+            )
+        })?;
+        let api_key = api_key.trim();
+        if api_key.is_empty() {
+            return Err(MicrosandboxError::InvalidConfig(
+                "CloudBackend API key must not be empty".into(),
+            ));
+        }
+        // Normalise trailing slash so per-route construction can append cleanly.
+        let url = url.trim_end_matches('/').to_string();
+        let api_key = api_key.to_string();
+
+        let http = if let Some(client) = self.custom_client {
+            client
+        } else {
+            let mut headers = HeaderMap::new();
+            let bearer = format!("Bearer {api_key}");
+            let mut auth_value = HeaderValue::from_str(&bearer).map_err(|e| {
+                MicrosandboxError::InvalidConfig(format!("invalid API key header value: {e}"))
+            })?;
+            auth_value.set_sensitive(true);
+            headers.insert(AUTHORIZATION, auth_value);
+            let ua = self.user_agent.unwrap_or_else(default_user_agent);
+            headers.insert(
+                USER_AGENT,
+                HeaderValue::from_str(&ua).map_err(|e| {
+                    MicrosandboxError::InvalidConfig(format!("invalid user-agent value: {e}"))
+                })?,
+            );
+
+            reqwest::Client::builder()
+                .timeout(self.request_timeout)
+                .default_headers(headers)
+                .build()
+                .map_err(|e| {
+                    MicrosandboxError::InvalidConfig(format!("failed to build HTTP client: {e}"))
+                })?
+        };
+
+        Ok(CloudBackend { url, api_key, http })
+    }
+}
+
+//--------------------------------------------------------------------------------------------------
+// Trait Implementations
+//--------------------------------------------------------------------------------------------------
+
+impl Backend for CloudBackend {
+    fn kind(&self) -> BackendKind {
+        BackendKind::Cloud
+    }
+
+    fn sandboxes(&self) -> &dyn SandboxBackend {
+        self
+    }
+}
+
+impl Default for CloudBackendBuilder {
+    fn default() -> Self {
+        Self {
+            url: None,
+            api_key: None,
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
+            user_agent: None,
+            custom_client: None,
+        }
+    }
+}
+
+impl From<CloudBackend> for Arc<dyn Backend> {
+    fn from(backend: CloudBackend) -> Self {
+        Arc::new(backend)
+    }
+}
+
+//--------------------------------------------------------------------------------------------------
+// Tests
+//--------------------------------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_succeeds_with_url_and_key() {
+        let b = CloudBackend::new("https://msb.example.com", "msb_test_abc").unwrap();
+        assert_eq!(b.kind(), BackendKind::Cloud);
+        assert_eq!(b.url(), "https://msb.example.com");
+    }
+
+    #[test]
+    fn new_strips_trailing_slash() {
+        let b = CloudBackend::new("https://msb.example.com/", "msb_test_abc").unwrap();
+        assert_eq!(b.url(), "https://msb.example.com");
+    }
+
+    #[test]
+    fn builder_rejects_missing_url() {
+        assert!(CloudBackendBuilder::default().api_key("k").build().is_err());
+    }
+
+    #[test]
+    fn builder_rejects_missing_key() {
+        assert!(
+            CloudBackendBuilder::default()
+                .url("https://x")
+                .build()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn builder_rejects_empty_url() {
+        assert!(CloudBackend::new("", "k").is_err());
+    }
+
+    #[test]
+    fn builder_rejects_whitespace_url() {
+        assert!(CloudBackend::new("   ", "k").is_err());
+    }
+
+    #[test]
+    fn builder_rejects_empty_key() {
+        assert!(CloudBackend::new("https://x", "").is_err());
+    }
+
+    #[test]
+    fn builder_rejects_whitespace_key() {
+        assert!(CloudBackend::new("https://x", "   ").is_err());
+    }
+
+    #[test]
+    fn from_env_errors_when_url_missing() {
+        // Note: this test can race with parallel tests setting env vars. Just
+        // verify the function returns an error when MSB_API_URL is clearly absent;
+        // we don't try to scrub env state.
+        unsafe { std::env::remove_var("MSB_API_URL") };
+        assert!(CloudBackend::from_env().is_err());
+    }
+
+    #[test]
+    fn cloud_http_error_uses_nested_error_body() {
+        let body: CloudErrorBody = serde_json::from_str(
+            r#"{"error":{"code":"sandbox_not_found","message":"sandbox missing"}}"#,
+        )
+        .unwrap();
+        let err = cloud_http_error(404, Some(&body), "", "GET /v1/sandboxes/by-name/:name");
+        assert!(
+            matches!(err, MicrosandboxError::SandboxNotFound(msg) if msg.contains("sandbox missing"))
+        );
+    }
+
+    #[test]
+    fn cloud_http_error_maps_create_conflict_to_already_exists() {
+        let body: CloudErrorBody = serde_json::from_str(
+            r#"{"error":{"code":"name_already_exists","message":"name taken"}}"#,
+        )
+        .unwrap();
+        let err = cloud_http_error(409, Some(&body), "", "POST /v1/sandboxes");
+        assert!(
+            matches!(err, MicrosandboxError::SandboxAlreadyExists(msg) if msg.contains("name taken"))
+        );
+    }
+}

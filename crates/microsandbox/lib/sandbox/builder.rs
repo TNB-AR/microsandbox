@@ -355,19 +355,6 @@ impl SandboxBuilder {
         self
     }
 
-    /// Override the libkrunfw shared library for this sandbox.
-    ///
-    /// By default, microsandbox resolves libkrunfw via the global config or
-    /// finds it next to the `msb` binary. Use this to point at a specific
-    /// libkrunfw build — for example, an unreleased firmware during
-    /// development.
-    ///
-    /// The path is validated at [`build`](Self::build) time.
-    pub fn libkrunfw_path(mut self, path: impl Into<PathBuf>) -> Self {
-        self.config.libkrunfw_path = Some(path.into());
-        self
-    }
-
     /// Set the user identity inside the sandbox (e.g., `"1000"`, `"appuser"`, `"1000:1000"`).
     pub fn user(mut self, user: impl Into<String>) -> Self {
         self.config.user = Some(user.into());
@@ -841,15 +828,6 @@ impl SandboxBuilder {
             _ => {}
         }
 
-        if let Some(path) = &self.config.libkrunfw_path
-            && !path.is_file()
-        {
-            return Err(crate::MicrosandboxError::InvalidConfig(format!(
-                "libkrunfw_path does not exist: {}",
-                path.display()
-            )));
-        }
-
         for rlimit in &self.config.rlimits {
             if rlimit.soft > rlimit.hard {
                 return Err(crate::MicrosandboxError::InvalidConfig(format!(
@@ -901,6 +879,48 @@ impl SandboxBuilder {
 
         Ok(())
     }
+}
+
+//--------------------------------------------------------------------------------------------------
+// Functions
+//--------------------------------------------------------------------------------------------------
+
+/// Maximum length of a sandbox name. Mirrors D12 of msb-cloud's `sdk-cloud-parity-plan.md`.
+/// Must stay in sync with msb-cloud's `MAX_SANDBOX_NAME_LEN` in `msb-api/src/validators/sandbox.rs`.
+const MAX_SANDBOX_NAME_LEN: usize = 128;
+
+/// Validate that a sandbox name is safe and matches the cross-repo D12 rule:
+/// alphanumeric / dot / hyphen / underscore, 1..=128 chars, must start alphanumeric.
+///
+/// **Must stay in sync with msb-cloud's `validate_sandbox_name`.** The rule lives
+/// in two places by D12's choice; if the rule changes here, change it there too.
+pub fn validate_sandbox_name(name: &str) -> MicrosandboxResult<()> {
+    if name.is_empty() {
+        return Err(crate::MicrosandboxError::InvalidConfig(
+            "sandbox name must not be empty".into(),
+        ));
+    }
+    if name.len() > MAX_SANDBOX_NAME_LEN {
+        return Err(crate::MicrosandboxError::InvalidConfig(format!(
+            "sandbox name must be at most {MAX_SANDBOX_NAME_LEN} characters: got {}",
+            name.len()
+        )));
+    }
+    let first_alphanumeric = name
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphanumeric());
+    let charset_ok = name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_');
+
+    if !first_alphanumeric || !charset_ok {
+        return Err(crate::MicrosandboxError::InvalidConfig(format!(
+            "sandbox name must start with an alphanumeric and contain only \
+             alphanumeric, dots, hyphens, and underscores: {name}"
+        )));
+    }
+    Ok(())
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -1372,5 +1392,81 @@ mod tests {
             err.to_string()
                 .contains("disk image host path does not exist")
         );
+    }
+
+    //----------------------------------------------------------------------------------------------
+    // Sandbox name validation (D12)
+    //----------------------------------------------------------------------------------------------
+
+    use super::{MAX_SANDBOX_NAME_LEN, validate_sandbox_name};
+
+    #[test]
+    fn sandbox_name_accepts_typical() {
+        for name in [
+            "foo",
+            "foo-bar",
+            "foo.bar",
+            "foo_bar",
+            "FooBar",
+            "abc123",
+            "a",
+            "0",
+            "agent-1",
+            "my.app_2026",
+        ] {
+            assert!(
+                validate_sandbox_name(name).is_ok(),
+                "expected {name:?} to be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn sandbox_name_rejects_empty() {
+        assert!(validate_sandbox_name("").is_err());
+    }
+
+    #[test]
+    fn sandbox_name_rejects_too_long() {
+        let long = "a".repeat(MAX_SANDBOX_NAME_LEN + 1);
+        assert!(validate_sandbox_name(&long).is_err());
+    }
+
+    #[test]
+    fn sandbox_name_accepts_at_max_length() {
+        let max = "a".repeat(MAX_SANDBOX_NAME_LEN);
+        assert!(validate_sandbox_name(&max).is_ok());
+    }
+
+    #[test]
+    fn sandbox_name_rejects_disallowed_chars() {
+        for name in [
+            "foo bar", "foo/bar", "foo:bar", "foo!", "foo@bar", "foo#1", "✨",
+        ] {
+            assert!(
+                validate_sandbox_name(name).is_err(),
+                "expected {name:?} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn sandbox_name_rejects_non_alphanumeric_start() {
+        for name in [".foo", "-foo", "_foo"] {
+            assert!(
+                validate_sandbox_name(name).is_err(),
+                "expected {name:?} to be rejected (non-alphanumeric start)"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn builder_validate_rejects_bad_name() {
+        let err = SandboxBuilder::new("bad name!")
+            .image("alpine")
+            .build()
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("alphanumeric"), "got: {err}");
     }
 }

@@ -185,15 +185,6 @@ pub struct SandboxConfig {
     #[serde(default, skip_serializing)]
     pub registry_auth: Option<RegistryAuth>,
 
-    /// Override the libkrunfw shared library path for this sandbox.
-    ///
-    /// When `None`, resolution falls back to the global config path, a sibling
-    /// of the `msb` binary, or `~/.microsandbox/lib/` (in that order).
-    ///
-    /// Not persisted — libkrunfw is a host-side resource, not sandbox state.
-    #[serde(skip)]
-    pub libkrunfw_path: Option<PathBuf>,
-
     /// Access the registry over plain HTTP (SDK override).
     #[serde(skip)]
     pub(crate) insecure: bool,
@@ -412,7 +403,6 @@ impl Default for SandboxConfig {
             pull_policy: PullPolicy::default(),
             policy: SandboxPolicy::default(),
             registry_auth: None,
-            libkrunfw_path: None,
             insecure: false,
             ca_certs: Vec::new(),
             replace_existing: false,

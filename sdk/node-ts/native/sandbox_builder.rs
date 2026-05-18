@@ -278,13 +278,10 @@ impl JsSandboxBuilder {
         self
     }
 
-    /// Override the libkrunfw shared library path for this sandbox.
-    #[napi(js_name = "libkrunfwPath")]
-    pub fn libkrunfw_path(&mut self, path: String) -> &Self {
-        let prev = self.take_inner();
-        self.inner = Some(prev.libkrunfw_path(PathBuf::from(path)));
-        self
-    }
+    // `libkrunfwPath` is no longer a per-sandbox builder method — it's a
+    // process-level concern (one dylib per process address space). Users set
+    // it once via `microsandbox.setLibkrunfwPath(...)` or the
+    // `MSB_LIBKRUNFW_PATH` env var. See msb-cloud's sdk-cloud-parity-plan.md D6.6.
 
     /// Default running user.
     #[napi]

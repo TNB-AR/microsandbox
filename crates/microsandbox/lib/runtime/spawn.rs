@@ -89,13 +89,12 @@ pub async fn spawn_sandbox(
     sandbox_id: i32,
     mode: SpawnMode,
 ) -> MicrosandboxResult<(ProcessHandle, PathBuf)> {
-    // Resolve paths. Per-sandbox `libkrunfw_path` takes precedence over the
-    // global resolver so SDK callers can point at a custom firmware bundle.
+    // libkrunfw is process-level (one dylib per process address space). The
+    // resolver consults MSB_LIBKRUNFW_PATH env, then SDK_LIBKRUNFW_PATH static,
+    // then config.paths.libkrunfw, then filesystem fallbacks — see
+    // `config::resolve_libkrunfw_path` for the full precedence ladder.
     let msb_path = config::resolve_msb_path()?;
-    let libkrunfw_path = match &config.libkrunfw_path {
-        Some(path) => path.clone(),
-        None => config::resolve_libkrunfw_path()?,
-    };
+    let libkrunfw_path = config::resolve_libkrunfw_path()?;
     tracing::debug!(
         msb = %msb_path.display(),
         libkrunfw = %libkrunfw_path.display(),
