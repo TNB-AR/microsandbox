@@ -115,7 +115,7 @@ impl Volume {
     /// Remove a volume by name via the active backend.
     pub async fn remove(name: &str) -> MicrosandboxResult<()> {
         let backend = crate::backend::default_backend();
-        backend.volumes().remove(name).await
+        backend.volumes().remove(backend.clone(), name).await
     }
 }
 
@@ -303,7 +303,10 @@ impl VolumeHandle {
     /// directory is easier to detect and clean up than an orphaned DB record.
     /// Cloud handles route through the backend's remove endpoint.
     pub async fn remove(&self) -> MicrosandboxResult<()> {
-        self.backend.volumes().remove(&self.name).await
+        self.backend
+            .volumes()
+            .remove(self.backend.clone(), &self.name)
+            .await
     }
 }
 

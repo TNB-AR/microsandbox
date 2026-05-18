@@ -160,16 +160,32 @@ pub trait SandboxBackend: Send + Sync {
     ) -> BoxFuture<'a, MicrosandboxResult<SandboxList>>;
 
     /// Remove/destroy a sandbox by name.
-    fn remove<'a>(&'a self, name: &'a str) -> BoxFuture<'a, MicrosandboxResult<()>>;
+    fn remove<'a>(
+        &'a self,
+        backend: Arc<dyn Backend>,
+        name: &'a str,
+    ) -> BoxFuture<'a, MicrosandboxResult<()>>;
 
     /// Stop a running sandbox by name (graceful).
-    fn stop<'a>(&'a self, name: &'a str) -> BoxFuture<'a, MicrosandboxResult<()>>;
+    fn stop<'a>(
+        &'a self,
+        backend: Arc<dyn Backend>,
+        name: &'a str,
+    ) -> BoxFuture<'a, MicrosandboxResult<()>>;
 
     /// Kill a running sandbox by name (SIGKILL).
-    fn kill<'a>(&'a self, name: &'a str) -> BoxFuture<'a, MicrosandboxResult<()>>;
+    fn kill<'a>(
+        &'a self,
+        backend: Arc<dyn Backend>,
+        name: &'a str,
+    ) -> BoxFuture<'a, MicrosandboxResult<()>>;
 
     /// Trigger a graceful drain on a sandbox by name.
-    fn drain<'a>(&'a self, name: &'a str) -> BoxFuture<'a, MicrosandboxResult<()>>;
+    fn drain<'a>(
+        &'a self,
+        backend: Arc<dyn Backend>,
+        name: &'a str,
+    ) -> BoxFuture<'a, MicrosandboxResult<()>>;
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -250,32 +266,36 @@ impl SandboxBackend for LocalBackend {
         })
     }
 
-    fn remove<'a>(&'a self, name: &'a str) -> BoxFuture<'a, MicrosandboxResult<()>> {
-        Box::pin(async move {
-            let backend: Arc<dyn Backend> = crate::backend::default_backend();
-            crate::sandbox::remove_local(backend, name).await
-        })
+    fn remove<'a>(
+        &'a self,
+        backend: Arc<dyn Backend>,
+        name: &'a str,
+    ) -> BoxFuture<'a, MicrosandboxResult<()>> {
+        Box::pin(async move { crate::sandbox::remove_local(backend, name).await })
     }
 
-    fn stop<'a>(&'a self, name: &'a str) -> BoxFuture<'a, MicrosandboxResult<()>> {
-        Box::pin(async move {
-            let backend: Arc<dyn Backend> = crate::backend::default_backend();
-            crate::sandbox::stop_local(backend, name).await
-        })
+    fn stop<'a>(
+        &'a self,
+        backend: Arc<dyn Backend>,
+        name: &'a str,
+    ) -> BoxFuture<'a, MicrosandboxResult<()>> {
+        Box::pin(async move { crate::sandbox::stop_local(backend, name).await })
     }
 
-    fn kill<'a>(&'a self, name: &'a str) -> BoxFuture<'a, MicrosandboxResult<()>> {
-        Box::pin(async move {
-            let backend: Arc<dyn Backend> = crate::backend::default_backend();
-            crate::sandbox::kill_local(backend, name).await
-        })
+    fn kill<'a>(
+        &'a self,
+        backend: Arc<dyn Backend>,
+        name: &'a str,
+    ) -> BoxFuture<'a, MicrosandboxResult<()>> {
+        Box::pin(async move { crate::sandbox::kill_local(backend, name).await })
     }
 
-    fn drain<'a>(&'a self, name: &'a str) -> BoxFuture<'a, MicrosandboxResult<()>> {
-        Box::pin(async move {
-            let backend: Arc<dyn Backend> = crate::backend::default_backend();
-            crate::sandbox::drain_local(backend, name).await
-        })
+    fn drain<'a>(
+        &'a self,
+        backend: Arc<dyn Backend>,
+        name: &'a str,
+    ) -> BoxFuture<'a, MicrosandboxResult<()>> {
+        Box::pin(async move { crate::sandbox::drain_local(backend, name).await })
     }
 }
 
@@ -368,21 +388,33 @@ impl SandboxBackend for CloudBackend {
         })
     }
 
-    fn remove<'a>(&'a self, name: &'a str) -> BoxFuture<'a, MicrosandboxResult<()>> {
+    fn remove<'a>(
+        &'a self,
+        _backend: Arc<dyn Backend>,
+        name: &'a str,
+    ) -> BoxFuture<'a, MicrosandboxResult<()>> {
         Box::pin(async move {
             CloudBackend::destroy_sandbox(self, name).await?;
             Ok(())
         })
     }
 
-    fn stop<'a>(&'a self, name: &'a str) -> BoxFuture<'a, MicrosandboxResult<()>> {
+    fn stop<'a>(
+        &'a self,
+        _backend: Arc<dyn Backend>,
+        name: &'a str,
+    ) -> BoxFuture<'a, MicrosandboxResult<()>> {
         Box::pin(async move {
             CloudBackend::stop_sandbox(self, name).await?;
             Ok(())
         })
     }
 
-    fn kill<'a>(&'a self, _name: &'a str) -> BoxFuture<'a, MicrosandboxResult<()>> {
+    fn kill<'a>(
+        &'a self,
+        _backend: Arc<dyn Backend>,
+        _name: &'a str,
+    ) -> BoxFuture<'a, MicrosandboxResult<()>> {
         Box::pin(async move {
             Err(unsupported(
                 "cloud sandbox kill",
@@ -391,7 +423,11 @@ impl SandboxBackend for CloudBackend {
         })
     }
 
-    fn drain<'a>(&'a self, _name: &'a str) -> BoxFuture<'a, MicrosandboxResult<()>> {
+    fn drain<'a>(
+        &'a self,
+        _backend: Arc<dyn Backend>,
+        _name: &'a str,
+    ) -> BoxFuture<'a, MicrosandboxResult<()>> {
         Box::pin(async move {
             Err(unsupported(
                 "cloud sandbox drain",

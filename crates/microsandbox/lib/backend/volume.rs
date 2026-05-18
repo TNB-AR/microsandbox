@@ -129,7 +129,11 @@ pub trait VolumeBackend: Send + Sync {
     ) -> BoxFuture<'a, MicrosandboxResult<Vec<VolumeHandle>>>;
 
     /// Remove a volume by name.
-    fn remove<'a>(&'a self, name: &'a str) -> BoxFuture<'a, MicrosandboxResult<()>>;
+    fn remove<'a>(
+        &'a self,
+        backend: Arc<dyn Backend>,
+        name: &'a str,
+    ) -> BoxFuture<'a, MicrosandboxResult<()>>;
 
     /// Read an entire file into memory as raw bytes.
     fn fs_read<'a>(
@@ -240,11 +244,12 @@ impl VolumeBackend for LocalBackend {
         Box::pin(async move { crate::volume::list_local(backend).await })
     }
 
-    fn remove<'a>(&'a self, name: &'a str) -> BoxFuture<'a, MicrosandboxResult<()>> {
-        Box::pin(async move {
-            let backend: Arc<dyn Backend> = crate::backend::default_backend();
-            crate::volume::remove_local(backend, name).await
-        })
+    fn remove<'a>(
+        &'a self,
+        backend: Arc<dyn Backend>,
+        name: &'a str,
+    ) -> BoxFuture<'a, MicrosandboxResult<()>> {
+        Box::pin(async move { crate::volume::remove_local(backend, name).await })
     }
 
     fn fs_read<'a>(
@@ -367,7 +372,11 @@ impl VolumeBackend for CloudBackend {
         Box::pin(async move { Err(unsupported("Volume::list")) })
     }
 
-    fn remove<'a>(&'a self, _name: &'a str) -> BoxFuture<'a, MicrosandboxResult<()>> {
+    fn remove<'a>(
+        &'a self,
+        _backend: Arc<dyn Backend>,
+        _name: &'a str,
+    ) -> BoxFuture<'a, MicrosandboxResult<()>> {
         Box::pin(async move { Err(unsupported("Volume::remove")) })
     }
 
@@ -473,5 +482,83 @@ fn unsupported(feature: &str) -> MicrosandboxError {
     MicrosandboxError::Unsupported {
         feature: feature.into(),
         available_when: "when cloud volumes ship".into(),
+    }
+}
+
+//--------------------------------------------------------------------------------------------------
+// Tests
+//--------------------------------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::{LocalBackend, set_default_backend};
+    use crate::volume::VolumeConfig;
+
+    /// Regression test for the asymmetric-signature P1: `LocalBackend::remove`
+    /// must operate on the passed-in `backend` Arc, not on the process-wide
+    /// `default_backend()`. Two `LocalBackend` instances live in separate
+    /// home dirs (so separate SQLite DBs). The default is installed on
+    /// backend A; backend B's trait impl is invoked directly. The remove
+    /// must hit B's DB (and fail because the volume doesn't exist there),
+    /// not silently succeed by re-resolving the default.
+    #[tokio::test]
+    async fn local_backend_remove_uses_passed_backend_not_global_default() {
+        let home_a = tempfile::tempdir().unwrap();
+        let home_b = tempfile::tempdir().unwrap();
+
+        let backend_a: Arc<dyn Backend> = Arc::new(
+            LocalBackend::builder()
+                .home(home_a.path())
+                .build()
+                .await
+                .unwrap(),
+        );
+        let backend_b: Arc<dyn Backend> = Arc::new(
+            LocalBackend::builder()
+                .home(home_b.path())
+                .build()
+                .await
+                .unwrap(),
+        );
+
+        // Create a volume only in backend A.
+        backend_a
+            .volumes()
+            .create(
+                backend_a.clone(),
+                VolumeConfig {
+                    name: "shared-name".into(),
+                    quota_mib: None,
+                    labels: Vec::new(),
+                },
+            )
+            .await
+            .unwrap();
+
+        // Install A as the process default. If the trait impl re-resolved
+        // `default_backend()` (the bug we just fixed) it would find A and
+        // successfully delete A's volume — even though we asked B.
+        set_default_backend(backend_a.clone());
+
+        // Call remove via backend B. Backend B has no such volume, so this
+        // must error with `VolumeNotFound`.
+        let err = backend_b
+            .volumes()
+            .remove(backend_b.clone(), "shared-name")
+            .await
+            .expect_err("remove should fail: volume does not exist in backend B");
+        assert!(
+            matches!(err, MicrosandboxError::VolumeNotFound(_)),
+            "expected VolumeNotFound, got: {err:?}"
+        );
+
+        // Sanity check: A's volume is still there — the misrouted remove
+        // would have deleted it.
+        let handles = backend_a.volumes().list(backend_a.clone()).await.unwrap();
+        assert!(
+            handles.iter().any(|h| h.name() == "shared-name"),
+            "backend A's volume should still exist after the (correctly-routed) B remove"
+        );
     }
 }

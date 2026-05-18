@@ -243,7 +243,7 @@ impl Sandbox {
     /// [`default_backend`](crate::backend::default_backend).
     pub async fn remove(name: &str) -> MicrosandboxResult<()> {
         let backend = crate::backend::default_backend();
-        backend.sandboxes().remove(name).await
+        backend.sandboxes().remove(backend.clone(), name).await
     }
 }
 
@@ -826,7 +826,10 @@ impl Sandbox {
                 local.client.send(&msg).await
             }
             crate::backend::SandboxInner::Cloud(_) => {
-                self.backend.sandboxes().stop(&self.name).await
+                self.backend
+                    .sandboxes()
+                    .stop(self.backend.clone(), &self.name)
+                    .await
             }
         }
     }
@@ -861,7 +864,10 @@ impl Sandbox {
                 )),
             },
             crate::backend::SandboxInner::Cloud(_) => {
-                self.backend.sandboxes().kill(&self.name).await
+                self.backend
+                    .sandboxes()
+                    .kill(self.backend.clone(), &self.name)
+                    .await
             }
         }
     }
@@ -877,7 +883,10 @@ impl Sandbox {
                 )),
             },
             crate::backend::SandboxInner::Cloud(_) => {
-                self.backend.sandboxes().drain(&self.name).await
+                self.backend
+                    .sandboxes()
+                    .drain(self.backend.clone(), &self.name)
+                    .await
             }
         }
     }

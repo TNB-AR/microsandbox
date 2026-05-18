@@ -362,7 +362,12 @@ impl SandboxHandle {
                 signal_pid(local.pid, nix::sys::signal::Signal::SIGTERM)?;
                 Ok(())
             }
-            SandboxHandleInner::Cloud(_) => self.backend.sandboxes().stop(&self.name).await,
+            SandboxHandleInner::Cloud(_) => {
+                self.backend
+                    .sandboxes()
+                    .stop(self.backend.clone(), &self.name)
+                    .await
+            }
         }
     }
 
@@ -406,7 +411,12 @@ impl SandboxHandle {
 
                 Ok(())
             }
-            SandboxHandleInner::Cloud(_) => self.backend.sandboxes().kill(&self.name).await,
+            SandboxHandleInner::Cloud(_) => {
+                self.backend
+                    .sandboxes()
+                    .kill(self.backend.clone(), &self.name)
+                    .await
+            }
         }
     }
 
@@ -441,7 +451,12 @@ impl SandboxHandle {
 
                 Ok(())
             }
-            SandboxHandleInner::Cloud(_) => self.backend.sandboxes().remove(&self.name).await,
+            SandboxHandleInner::Cloud(_) => {
+                self.backend
+                    .sandboxes()
+                    .remove(self.backend.clone(), &self.name)
+                    .await
+            }
         }
     }
 }
