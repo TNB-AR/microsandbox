@@ -187,8 +187,7 @@ async fn inspect(args: VolumeInspectArgs) -> anyhow::Result<()> {
             .join(", ")
     };
 
-    let volumes_dir = microsandbox::config::config().volumes_dir();
-    let path = volumes_dir.join(handle.name());
+    let path = microsandbox::LocalBackend::ambient().volume_path(handle.name());
 
     ui::detail_kv("Name", handle.name());
     ui::detail_kv("Quota", &quota);

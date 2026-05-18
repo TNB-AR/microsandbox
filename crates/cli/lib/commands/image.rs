@@ -187,8 +187,9 @@ async fn run_pull_inner(
 ) -> anyhow::Result<()> {
     let start = Instant::now();
 
-    let global = microsandbox::config::config();
-    let cache = microsandbox_image::GlobalCache::new(&global.cache_dir())?;
+    let backend = microsandbox::LocalBackend::ambient();
+    let global = backend.config();
+    let cache = microsandbox_image::GlobalCache::new(&backend.cache_dir())?;
     let platform = microsandbox_image::Platform::host_linux();
     let image_ref: microsandbox_image::Reference = reference
         .parse()
@@ -289,7 +290,7 @@ async fn run_pull_inner(
     }
 
     // Persist to database.
-    let cache = microsandbox_image::GlobalCache::new(&global.cache_dir())?;
+    let cache = microsandbox_image::GlobalCache::new(&backend.cache_dir())?;
     match cache.read_image_metadata(&image_ref) {
         Ok(Some(metadata)) => {
             if let Err(e) = Image::persist(&reference, metadata).await {
@@ -342,8 +343,8 @@ pub(crate) async fn pull_if_missing(reference: &str, quiet: bool) -> anyhow::Res
         return Ok(());
     }
 
-    let global = microsandbox::config::config();
-    let cache = microsandbox_image::GlobalCache::new(&global.cache_dir())?;
+    let backend = microsandbox::LocalBackend::ambient();
+    let cache = microsandbox_image::GlobalCache::new(&backend.cache_dir())?;
     let image_ref: microsandbox_image::Reference = reference
         .parse()
         .map_err(|e| anyhow::anyhow!("invalid image reference: {e}"))?;

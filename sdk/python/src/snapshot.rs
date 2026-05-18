@@ -163,7 +163,7 @@ impl PySnapshot {
     #[staticmethod]
     #[pyo3(signature = (dir = None))]
     fn reindex<'py>(py: Python<'py>, dir: Option<PathBuf>) -> PyResult<Bound<'py, PyAny>> {
-        let dir = dir.unwrap_or_else(|| microsandbox::config::config().snapshots_dir());
+        let dir = dir.unwrap_or_else(|| microsandbox::LocalBackend::ambient().snapshots_dir());
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let n = RustSnapshot::reindex(&dir).await.map_err(to_py_err)?;
             Ok(n)

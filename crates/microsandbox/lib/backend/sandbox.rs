@@ -226,7 +226,7 @@ impl SandboxBackend for LocalBackend {
         name: &'a str,
     ) -> BoxFuture<'a, MicrosandboxResult<SandboxHandle>> {
         Box::pin(async move {
-            let (model, pid) = crate::sandbox::get_local_handle_state(name).await?;
+            let (model, pid) = crate::sandbox::get_local_handle_state(self, name).await?;
             Ok(SandboxHandle::from_local_model(backend, model, pid))
         })
     }
@@ -238,7 +238,7 @@ impl SandboxBackend for LocalBackend {
         _limit: Option<u32>,
     ) -> BoxFuture<'a, MicrosandboxResult<SandboxList>> {
         Box::pin(async move {
-            let rows = crate::sandbox::list_local_handle_state().await?;
+            let rows = crate::sandbox::list_local_handle_state(self).await?;
             let sandboxes = rows
                 .into_iter()
                 .map(|(model, pid)| SandboxHandle::from_local_model(backend.clone(), model, pid))
@@ -251,19 +251,31 @@ impl SandboxBackend for LocalBackend {
     }
 
     fn remove<'a>(&'a self, name: &'a str) -> BoxFuture<'a, MicrosandboxResult<()>> {
-        Box::pin(async move { crate::sandbox::remove_local(name).await })
+        Box::pin(async move {
+            let backend: Arc<dyn Backend> = crate::backend::default_backend();
+            crate::sandbox::remove_local(backend, name).await
+        })
     }
 
     fn stop<'a>(&'a self, name: &'a str) -> BoxFuture<'a, MicrosandboxResult<()>> {
-        Box::pin(async move { crate::sandbox::stop_local(name).await })
+        Box::pin(async move {
+            let backend: Arc<dyn Backend> = crate::backend::default_backend();
+            crate::sandbox::stop_local(backend, name).await
+        })
     }
 
     fn kill<'a>(&'a self, name: &'a str) -> BoxFuture<'a, MicrosandboxResult<()>> {
-        Box::pin(async move { crate::sandbox::kill_local(name).await })
+        Box::pin(async move {
+            let backend: Arc<dyn Backend> = crate::backend::default_backend();
+            crate::sandbox::kill_local(backend, name).await
+        })
     }
 
     fn drain<'a>(&'a self, name: &'a str) -> BoxFuture<'a, MicrosandboxResult<()>> {
-        Box::pin(async move { crate::sandbox::drain_local(name).await })
+        Box::pin(async move {
+            let backend: Arc<dyn Backend> = crate::backend::default_backend();
+            crate::sandbox::drain_local(backend, name).await
+        })
     }
 }
 

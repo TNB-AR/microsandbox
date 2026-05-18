@@ -30,7 +30,8 @@ pub(super) async fn create_snapshot(config: SnapshotConfig) -> MicrosandboxResul
         record_integrity,
     } = config;
 
-    let db = crate::db::init_global().await?.read();
+    let backend = crate::backend::LocalBackend::ambient();
+    let db = backend.db().await?.read();
 
     // Look up the sandbox row + parse its persisted config.
     let model = sandbox_entity::Entity::find()
@@ -60,9 +61,7 @@ pub(super) async fn create_snapshot(config: SnapshotConfig) -> MicrosandboxResul
     let image_reference = oci_reference_string(&sandbox_config)?;
 
     // Resolve source upper.ext4 path from the canonical sandbox layout.
-    let sandbox_dir = crate::config::config()
-        .sandboxes_dir()
-        .join(&source_sandbox);
+    let sandbox_dir = backend.sandboxes_dir().join(&source_sandbox);
     let src_upper = sandbox_dir.join("upper.ext4");
     if !src_upper.exists() {
         return Err(MicrosandboxError::Custom(format!(
@@ -182,7 +181,9 @@ fn resolve_destination(dest: &SnapshotDestination) -> MicrosandboxResult<PathBuf
                     "snapshot name must be a bare identifier, not a path: '{name}'"
                 )));
             }
-            Ok(crate::config::config().snapshots_dir().join(name))
+            Ok(crate::backend::LocalBackend::ambient()
+                .snapshots_dir()
+                .join(name))
         }
     }
 }

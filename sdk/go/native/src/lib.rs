@@ -3382,9 +3382,8 @@ fn volume_handle_json(vh: &VolumeHandle) -> String {
         .map(|(k, v)| (k.as_str(), v.as_str()))
         .collect();
     let labels_json = serde_json::to_string(&labels_map).unwrap_or_else(|_| "{}".into());
-    let path = microsandbox::config::config()
-        .volumes_dir()
-        .join(vh.name())
+    let path = microsandbox::LocalBackend::ambient()
+        .volume_path(vh.name())
         .to_string_lossy()
         .into_owned();
     let name_json = serde_json::to_string(vh.name()).unwrap_or_else(|_| "\"\"".into());

@@ -36,25 +36,33 @@ const DEFAULT_OCI_UPPER_SIZE_MIB: u32 = 4 * 1024;
 pub const DEFAULT_REPLACE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 fn default_cpus() -> u8 {
-    crate::config::config().sandbox_defaults.cpus
+    crate::backend::LocalBackend::ambient()
+        .config()
+        .sandbox_defaults
+        .cpus
 }
 
 fn default_memory_mib() -> u32 {
-    crate::config::config().sandbox_defaults.memory_mib
+    crate::backend::LocalBackend::ambient()
+        .config()
+        .sandbox_defaults
+        .memory_mib
 }
 
 fn default_log_level() -> Option<LogLevel> {
-    crate::config::config().log_level
+    crate::backend::LocalBackend::ambient().config().log_level
 }
 
 fn default_metrics_sample_interval_ms() -> Option<NonZero<u64>> {
-    crate::config::config()
+    crate::backend::LocalBackend::ambient()
+        .config()
         .sandbox_defaults
         .metrics_sample_interval_ms
 }
 
 fn default_disable_metrics_sample() -> bool {
-    crate::config::config()
+    crate::backend::LocalBackend::ambient()
+        .config()
         .sandbox_defaults
         .disable_metrics_sample
 }

@@ -59,7 +59,14 @@ impl Sandbox {
         if self.config().effective_metrics_interval().is_none() {
             return Err(MicrosandboxError::MetricsDisabled(self.name().to_string()));
         }
-        let db = crate::db::init_global().await?.read();
+        let backend = self
+            .backend()
+            .as_local()
+            .ok_or_else(|| MicrosandboxError::Unsupported {
+                feature: "Sandbox::metrics on cloud".into(),
+                available_when: "when cloud metrics land".into(),
+            })?;
+        let db = backend.db().await?.read();
         metrics_for_sandbox(db, local.db_id, memory_limit_bytes(self.config())).await
     }
 
@@ -103,16 +110,27 @@ impl Sandbox {
             interval
         };
 
+        let backend = self.backend().clone();
         let s: S = Box::pin(stream::unfold(
             tokio::time::interval(interval),
-            move |mut ticker| async move {
-                ticker.tick().await;
-                let pools = crate::db::init_global().await;
-                let item = match pools {
-                    Ok(pools) => metrics_for_sandbox(pools.read(), db_id, memory_limit_bytes).await,
-                    Err(err) => Err(err),
-                };
-                Some((item, ticker))
+            move |mut ticker| {
+                let backend = backend.clone();
+                async move {
+                    ticker.tick().await;
+                    let item = match backend.as_local() {
+                        Some(local) => match local.db().await {
+                            Ok(pools) => {
+                                metrics_for_sandbox(pools.read(), db_id, memory_limit_bytes).await
+                            }
+                            Err(err) => Err(err),
+                        },
+                        None => Err(MicrosandboxError::Unsupported {
+                            feature: "Sandbox::metrics_stream on cloud".into(),
+                            available_when: "when cloud metrics land".into(),
+                        }),
+                    };
+                    Some((item, ticker))
+                }
             },
         ));
         s
@@ -125,7 +143,8 @@ impl Sandbox {
 
 /// Get the latest metrics snapshot for every running sandbox.
 pub async fn all_sandbox_metrics() -> MicrosandboxResult<HashMap<String, SandboxMetrics>> {
-    let pools = crate::db::init_global().await?;
+    let backend = crate::backend::LocalBackend::ambient();
+    let pools = backend.db().await?;
     let db = pools.read();
     let sandboxes = sandbox_entity::Entity::find()
         .filter(

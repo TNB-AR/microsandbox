@@ -31,7 +31,7 @@ pub use cloud_wire::{
     CloudCreateSandboxRequest, CloudErrorBody, CloudMessageResponse, CloudPaginated, CloudSandbox,
     CloudSandboxStatus,
 };
-pub use local::LocalBackend;
+pub use local::{LocalBackend, LocalBackendBuilder};
 pub use profile::{Profile, ProfileBackend, SdkConfig, load_sdk_config, resolve_default_backend};
 pub use sandbox::{
     SandboxBackend, SandboxCloudState, SandboxHandleCloudState, SandboxHandleInner,
@@ -74,6 +74,15 @@ pub trait Backend: Send + Sync + 'static {
 
     /// Return the volume lifecycle backend.
     fn volumes(&self) -> &dyn VolumeBackend;
+
+    /// Downcast to a concrete `&LocalBackend` when this backend is local.
+    ///
+    /// Used by helpers that need access to local-only state (DB pool, config
+    /// paths) without keeping a separate `Arc<LocalBackend>` alongside the
+    /// `Arc<dyn Backend>`. Returns `None` for cloud backends.
+    fn as_local(&self) -> Option<&LocalBackend> {
+        None
+    }
 }
 
 //--------------------------------------------------------------------------------------------------

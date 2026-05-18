@@ -138,7 +138,7 @@ fn default_backend_kind() -> &'static str {
 /// Intended as a test/diagnostic hook for verifying the Python-to-native bridge.
 #[pyfunction]
 fn resolved_msb_path() -> PyResult<String> {
-    microsandbox::config::resolve_msb_path()
+    microsandbox::config::resolve_msb_path(microsandbox::LocalBackend::ambient().config())
         .map(|path| path.to_string_lossy().into_owned())
         .map_err(error::to_py_err)
 }

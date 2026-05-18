@@ -219,7 +219,14 @@ impl SandboxHandle {
             return Err(crate::MicrosandboxError::MetricsDisabled(self.name.clone()));
         }
 
-        let db = crate::db::init_global().await?.read();
+        let local_backend =
+            self.backend
+                .as_local()
+                .ok_or_else(|| crate::MicrosandboxError::Unsupported {
+                    feature: "SandboxHandle::metrics on cloud".into(),
+                    available_when: "when cloud metrics land".into(),
+                })?;
+        let db = local_backend.db().await?.read();
         super::metrics::metrics_for_sandbox(
             db,
             local.db_id,
@@ -267,8 +274,14 @@ impl SandboxHandle {
             )));
         }
 
-        let global = crate::config::config();
-        let sock_path = global
+        let local_backend =
+            self.backend
+                .as_local()
+                .ok_or_else(|| crate::MicrosandboxError::Unsupported {
+                    feature: "SandboxHandle::connect on cloud".into(),
+                    available_when: "when cloud attach lands".into(),
+                })?;
+        let sock_path = local_backend
             .sandboxes_dir()
             .join(&self.name)
             .join("runtime")
@@ -376,7 +389,13 @@ impl SandboxHandle {
                 let all_dead = pids.is_empty() || pids.iter().all(|pid| !super::pid_is_alive(*pid));
 
                 if all_dead {
-                    let db = crate::db::init_global().await?.write();
+                    let local_backend = self.backend.as_local().ok_or_else(|| {
+                        crate::MicrosandboxError::Unsupported {
+                            feature: "SandboxHandle::kill on cloud".into(),
+                            available_when: "when cloud kill lands".into(),
+                        }
+                    })?;
+                    let db = local_backend.db().await?.write();
                     if let Err(e) =
                         super::update_sandbox_status(db, local.db_id, SandboxStatus::Stopped).await
                     {
@@ -407,11 +426,15 @@ impl SandboxHandle {
                     )));
                 }
 
-                let pools = crate::db::init_global().await?;
+                let local_backend = self.backend.as_local().ok_or_else(|| {
+                    crate::MicrosandboxError::Unsupported {
+                        feature: "SandboxHandle::remove on cloud".into(),
+                        available_when: "wired via Cloud variant".into(),
+                    }
+                })?;
+                let pools = local_backend.db().await?;
 
-                super::remove_dir_if_exists(
-                    &crate::config::config().sandboxes_dir().join(&self.name),
-                )?;
+                super::remove_dir_if_exists(&local_backend.sandboxes_dir().join(&self.name))?;
                 sandbox_entity::Entity::delete_by_id(local.db_id)
                     .exec(pools.write())
                     .await?;

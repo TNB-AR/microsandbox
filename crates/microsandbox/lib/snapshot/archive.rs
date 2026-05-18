@@ -67,7 +67,7 @@ pub(super) async fn export_snapshot(
     // Optional image cache bundling.
     let mut cache_files: Vec<(PathBuf, String)> = Vec::new();
     if opts.with_image {
-        let cache_dir = crate::config::config().cache_dir();
+        let cache_dir = crate::backend::LocalBackend::ambient().cache_dir();
         let img_digest_str = head.manifest().image.manifest_digest.clone();
         let img_digest: microsandbox_image::Digest = img_digest_str
             .parse()
@@ -142,10 +142,10 @@ pub(super) async fn import_snapshot(
 ) -> MicrosandboxResult<SnapshotHandle> {
     let snapshots_dir = match dest {
         Some(d) => d.to_path_buf(),
-        None => crate::config::config().snapshots_dir(),
+        None => crate::backend::LocalBackend::ambient().snapshots_dir(),
     };
     tokio::fs::create_dir_all(&snapshots_dir).await?;
-    let cache_dir = crate::config::config().cache_dir();
+    let cache_dir = crate::backend::LocalBackend::ambient().cache_dir();
 
     // Stream rather than slurp — archives carry the full upper layer and are
     // routinely multi-GB.

@@ -29,7 +29,7 @@ pub use agent::{
 pub use backend::{
     Backend, BackendKind, CloudBackend, CloudBackendBuilder, CloudCreateSandboxRequest,
     CloudErrorBody, CloudMessageResponse, CloudPaginated, CloudSandbox, CloudSandboxStatus,
-    LocalBackend, Profile, ProfileBackend, SandboxBackend, SandboxCloudState,
+    LocalBackend, LocalBackendBuilder, Profile, ProfileBackend, SandboxBackend, SandboxCloudState,
     SandboxHandleCloudState, SandboxHandleInner, SandboxHandleLocalState, SandboxInner,
     SandboxList, SandboxLocalState, SdkConfig, VolumeBackend, VolumeCloudState,
     VolumeHandleCloudState, VolumeHandleInner, VolumeHandleLocalState, VolumeInner,

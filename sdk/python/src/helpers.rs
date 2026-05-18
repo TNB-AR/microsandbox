@@ -1258,6 +1258,8 @@ fn resolve_snapshot_dir(s: &str) -> std::path::PathBuf {
     if s.contains('/') || s.starts_with('.') || s.starts_with('~') {
         std::path::PathBuf::from(s)
     } else {
-        microsandbox::config::config().snapshots_dir().join(s)
+        microsandbox::LocalBackend::ambient()
+            .snapshots_dir()
+            .join(s)
     }
 }

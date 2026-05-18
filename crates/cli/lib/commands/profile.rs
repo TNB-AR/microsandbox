@@ -136,7 +136,7 @@ fn run_use(args: ProfileUseArgs) -> Result<()> {
 }
 
 /// Read `~/.microsandbox/config.json` as raw JSON, set `active_profile`,
-/// write it back. Preserves all other keys (including `GlobalConfig` fields,
+/// write it back. Preserves all other keys (including `LocalConfig` fields,
 /// which live in the same file).
 fn set_active_profile(name: &str) -> Result<()> {
     let path = microsandbox::config::config_path();

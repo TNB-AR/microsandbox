@@ -214,7 +214,7 @@ impl VolumeFs<'_> {
                 available_when: "when cloud streaming routes ship".into(),
             });
         }
-        let root = crate::config::config().volumes_dir().join(self.name);
+        let root = crate::backend::LocalBackend::ambient().volume_path(self.name);
         local::resolve_relative(&root, path)
     }
 }
@@ -342,7 +342,7 @@ pub(crate) mod local {
 
     /// Volume root directory on the host for the named volume.
     fn volume_root(name: &str) -> PathBuf {
-        crate::config::config().volumes_dir().join(name)
+        crate::backend::LocalBackend::ambient().volume_path(name)
     }
 
     /// Resolve `(volume_name, path)` to a canonical host path.

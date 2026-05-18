@@ -3,7 +3,6 @@
 use std::fs;
 
 use clap::Args;
-use microsandbox::config;
 
 use super::install::MARKER;
 use crate::ui;
@@ -26,7 +25,10 @@ pub struct UninstallArgs {
 
 /// Execute the `msb uninstall` command.
 pub async fn run(args: UninstallArgs) -> anyhow::Result<()> {
-    let bin_dir = config::config().home().join("bin");
+    let bin_dir = microsandbox::LocalBackend::ambient()
+        .config()
+        .home()
+        .join("bin");
 
     let mut failed = false;
 

@@ -40,11 +40,8 @@ use microsandbox_image::{
 use crate::{
     MicrosandboxResult,
     agent::AgentClient,
-    db::{
-        self,
-        entity::{
-            run as run_entity, sandbox as sandbox_entity, sandbox_rootfs as sandbox_rootfs_entity,
-        },
+    db::entity::{
+        run as run_entity, sandbox as sandbox_entity, sandbox_rootfs as sandbox_rootfs_entity,
     },
     runtime::{ProcessHandle, SpawnMode, spawn_sandbox},
 };
@@ -314,6 +311,14 @@ pub(crate) async fn create_local(
         "create_local: starting"
     );
 
+    let local_backend =
+        backend
+            .as_local()
+            .ok_or_else(|| crate::MicrosandboxError::Unsupported {
+                feature: "create_local".into(),
+                available_when: "with a LocalBackend".into(),
+            })?;
+
     let mut pinned_manifest_digest: Option<String> = None;
     let mut pinned_reference: Option<String> = None;
 
@@ -322,8 +327,8 @@ pub(crate) async fn create_local(
 
     // Initialize the database before any expensive image pull so we can
     // fail fast on conflicting persisted sandbox state.
-    let db = db::init_global().await?;
-    let sandbox_dir = crate::config::config().sandboxes_dir().join(&config.name);
+    let db = local_backend.db().await?;
+    let sandbox_dir = local_backend.sandboxes_dir().join(&config.name);
     prepare_create_target(db, &config, &sandbox_dir).await?;
 
     // Resolve OCI images before spawning the sandbox process.
@@ -333,8 +338,14 @@ pub(crate) async fn create_local(
             insecure: config.insecure,
             ca_certs: config.ca_certs.clone(),
         };
-        let pull_result =
-            pull_oci_image(&reference, config.pull_policy, overrides, progress).await?;
+        let pull_result = pull_oci_image(
+            local_backend,
+            &reference,
+            config.pull_policy,
+            overrides,
+            progress,
+        )
+        .await?;
 
         // Merge image config defaults under user-provided config.
         config.merge_image_defaults(&pull_result.config);
@@ -343,7 +354,7 @@ pub(crate) async fn create_local(
         pinned_reference = Some(reference.clone());
 
         // Verify VMDK exists in the global cache.
-        let cache_dir = crate::config::config().cache_dir();
+        let cache_dir = local_backend.cache_dir();
         let cache = GlobalCache::new_async(&cache_dir).await?;
 
         let vmdk_path = cache.vmdk_path(&pull_result.manifest_digest);
@@ -432,7 +443,7 @@ pub(crate) async fn create_local(
             return Err(e);
         }
     };
-    let sandbox = Sandbox::from_local(backend, local_state, returned_config);
+    let sandbox = Sandbox::from_local(backend.clone(), local_state, returned_config);
 
     if let (Some(_reference), Some(manifest_digest)) = (
         pinned_reference.as_deref(),
@@ -466,7 +477,14 @@ pub(crate) async fn start_local(
     mode: SpawnMode,
 ) -> MicrosandboxResult<Sandbox> {
     tracing::debug!(sandbox = name, ?mode, "start_local: loading record");
-    let pools = db::init_global().await?;
+    let local_backend =
+        backend
+            .as_local()
+            .ok_or_else(|| crate::MicrosandboxError::Unsupported {
+                feature: "start_local".into(),
+                available_when: "with a LocalBackend".into(),
+            })?;
+    let pools = local_backend.db().await?;
     let write_db = pools.write();
     let model = load_sandbox_record_reconciled(pools, name).await?;
     tracing::debug!(sandbox = name, status = ?model.status, "start_local: current status");
@@ -487,7 +505,11 @@ pub(crate) async fn start_local(
     let mut config: SandboxConfig = serde_json::from_str(&model.config)?;
     config.apply_runtime_defaults();
     validate_rootfs_source(&config.image)?;
-    validate_start_state(&config, &crate::config::config().sandboxes_dir().join(name))?;
+    validate_start_state(
+        local_backend,
+        &config,
+        &local_backend.sandboxes_dir().join(name),
+    )?;
     update_sandbox_status(write_db, model.id, SandboxStatus::Running).await?;
 
     match create_inner_local(config, model.id, mode).await {
@@ -533,9 +555,10 @@ async fn create_inner_local(
 /// Load the local DB row + active PID for a sandbox handle. Called from the
 /// `SandboxBackend::get` impl on `LocalBackend`.
 pub(crate) async fn get_local_handle_state(
+    local_backend: &crate::backend::LocalBackend,
     name: &str,
 ) -> MicrosandboxResult<(sandbox_entity::Model, Option<i32>)> {
-    let pools = db::init_global().await?;
+    let pools = local_backend.db().await?;
     let model = sandbox_entity::Entity::find()
         .filter(sandbox_entity::Column::Name.eq(name))
         .one(pools.read())
@@ -549,9 +572,10 @@ pub(crate) async fn get_local_handle_state(
 
 /// Load all local DB rows + their active PIDs. Called from the
 /// `SandboxBackend::list` impl on `LocalBackend`.
-pub(crate) async fn list_local_handle_state()
--> MicrosandboxResult<Vec<(sandbox_entity::Model, Option<i32>)>> {
-    let pools = db::init_global().await?;
+pub(crate) async fn list_local_handle_state(
+    local_backend: &crate::backend::LocalBackend,
+) -> MicrosandboxResult<Vec<(sandbox_entity::Model, Option<i32>)>> {
+    let pools = local_backend.db().await?;
     let sandboxes = sandbox_entity::Entity::find()
         .order_by_desc(sandbox_entity::Column::CreatedAt)
         .all(pools.read())
@@ -574,33 +598,70 @@ pub(crate) async fn list_local_handle_state()
 }
 
 /// Local lifecycle: remove a stopped sandbox by name.
-pub(crate) async fn remove_local(name: &str) -> MicrosandboxResult<()> {
-    let (model, pid) = get_local_handle_state(name).await?;
-    let backend = crate::backend::default_backend();
+pub(crate) async fn remove_local(
+    backend: Arc<dyn crate::backend::Backend>,
+    name: &str,
+) -> MicrosandboxResult<()> {
+    let local_backend =
+        backend
+            .as_local()
+            .ok_or_else(|| crate::MicrosandboxError::Unsupported {
+                feature: "remove_local".into(),
+                available_when: "with a LocalBackend".into(),
+            })?;
+    let (model, pid) = get_local_handle_state(local_backend, name).await?;
     let handle = SandboxHandle::from_local_model(backend, model, pid);
     handle.remove().await
 }
 
 /// Local lifecycle: stop a sandbox by name (SIGTERM).
-pub(crate) async fn stop_local(name: &str) -> MicrosandboxResult<()> {
-    let (model, pid) = get_local_handle_state(name).await?;
-    let backend = crate::backend::default_backend();
+pub(crate) async fn stop_local(
+    backend: Arc<dyn crate::backend::Backend>,
+    name: &str,
+) -> MicrosandboxResult<()> {
+    let local_backend =
+        backend
+            .as_local()
+            .ok_or_else(|| crate::MicrosandboxError::Unsupported {
+                feature: "stop_local".into(),
+                available_when: "with a LocalBackend".into(),
+            })?;
+    let (model, pid) = get_local_handle_state(local_backend, name).await?;
     let handle = SandboxHandle::from_local_model(backend, model, pid);
     handle.stop().await
 }
 
 /// Local lifecycle: kill a sandbox by name (SIGKILL).
-pub(crate) async fn kill_local(name: &str) -> MicrosandboxResult<()> {
-    let (model, pid) = get_local_handle_state(name).await?;
-    let backend = crate::backend::default_backend();
+pub(crate) async fn kill_local(
+    backend: Arc<dyn crate::backend::Backend>,
+    name: &str,
+) -> MicrosandboxResult<()> {
+    let local_backend =
+        backend
+            .as_local()
+            .ok_or_else(|| crate::MicrosandboxError::Unsupported {
+                feature: "kill_local".into(),
+                available_when: "with a LocalBackend".into(),
+            })?;
+    let (model, pid) = get_local_handle_state(local_backend, name).await?;
     let mut handle = SandboxHandle::from_local_model(backend, model, pid);
     handle.kill().await
 }
 
 /// Local lifecycle: drain a running sandbox by name (SIGUSR1 to the
 /// libkrun process).
-pub(crate) async fn drain_local(name: &str) -> MicrosandboxResult<()> {
-    let (_, pid) = get_local_handle_state(name).await?;
+pub(crate) async fn drain_local(
+    backend: Arc<dyn crate::backend::Backend>,
+    name: &str,
+) -> MicrosandboxResult<()> {
+    let local_backend =
+        backend
+            .as_local()
+            .ok_or_else(|| crate::MicrosandboxError::Unsupported {
+                feature: "drain_local".into(),
+                available_when: "with a LocalBackend".into(),
+            })?;
+    let (_, pid) = get_local_handle_state(local_backend, name).await?;
     if let Some(pid) = pid.filter(|p| pid_is_alive(*p)) {
         nix::sys::signal::kill(
             nix::unistd::Pid::from_raw(pid),
@@ -621,9 +682,16 @@ impl Sandbox {
     /// [`Sandbox::remove`] / the backend trait's `remove` method.
     pub async fn remove_persisted(self) -> MicrosandboxResult<()> {
         let local = self.require_local("remove_persisted")?;
-        let pools = db::init_global().await?;
+        let local_backend =
+            self.backend
+                .as_local()
+                .ok_or_else(|| crate::MicrosandboxError::Unsupported {
+                    feature: "Sandbox::remove_persisted on cloud".into(),
+                    available_when: "never — cloud sandboxes are removed via the API".into(),
+                })?;
+        let pools = local_backend.db().await?;
 
-        remove_dir_if_exists(&crate::config::config().sandboxes_dir().join(&self.name))?;
+        remove_dir_if_exists(&local_backend.sandboxes_dir().join(&self.name))?;
         sandbox_entity::Entity::delete_by_id(local.db_id)
             .exec(pools.write())
             .await?;
@@ -1611,7 +1679,8 @@ pub(super) async fn update_sandbox_status(
 /// from updating the database on exit are cleaned up without blocking the
 /// main path.
 pub async fn reap_stale_sandboxes() -> MicrosandboxResult<()> {
-    let pools = db::init_global().await?;
+    let backend = crate::backend::LocalBackend::ambient();
+    let pools = backend.db().await?;
 
     let stale = sandbox_entity::Entity::find()
         .filter(
@@ -1812,13 +1881,14 @@ pub(super) fn pid_is_alive(pid: i32) -> bool {
 /// When `progress` is `Some`, uses `pull_with_sender()` to emit per-layer
 /// progress events. The caller must consume the corresponding `PullProgressHandle`.
 async fn pull_oci_image(
+    local_backend: &crate::backend::LocalBackend,
     reference: &str,
     pull_policy: PullPolicy,
     registry_overrides: RegistryOverrides,
     progress: Option<PullProgressSender>,
 ) -> MicrosandboxResult<PullResult> {
-    let global = crate::config::config();
-    let cache = GlobalCache::new(&global.cache_dir())?;
+    let global = local_backend.config();
+    let cache = GlobalCache::new(&local_backend.cache_dir())?;
     let platform = microsandbox_image::Platform::host_linux();
     let image_ref: Reference = reference.parse().map_err(|e| {
         crate::MicrosandboxError::InvalidConfig(format!("invalid image reference: {e}"))
@@ -2104,7 +2174,11 @@ async fn wait_for_pids_to_exit(pids: &[i32], timeout: std::time::Duration) {
     }
 }
 
-fn validate_start_state(config: &SandboxConfig, sandbox_dir: &Path) -> MicrosandboxResult<()> {
+fn validate_start_state(
+    local_backend: &crate::backend::LocalBackend,
+    config: &SandboxConfig,
+    sandbox_dir: &Path,
+) -> MicrosandboxResult<()> {
     if !sandbox_dir.exists() {
         return Err(crate::MicrosandboxError::Custom(format!(
             "sandbox state missing for '{}': {}",
@@ -2116,7 +2190,7 @@ fn validate_start_state(config: &SandboxConfig, sandbox_dir: &Path) -> Microsand
     if let RootfsSource::Oci(_) = &config.image
         && let Some(ref digest_str) = config.manifest_digest
     {
-        let cache_dir = crate::config::config().cache_dir();
+        let cache_dir = local_backend.cache_dir();
         if let Ok(cache) = GlobalCache::new(&cache_dir)
             && let Ok(digest) = digest_str.parse::<Digest>()
         {
@@ -2763,7 +2837,8 @@ mod tests {
             ..Default::default()
         };
 
-        let err = super::validate_start_state(&config, &sandbox_dir).unwrap_err();
+        let backend = crate::backend::LocalBackend::lazy();
+        let err = super::validate_start_state(&backend, &config, &sandbox_dir).unwrap_err();
         assert!(err.to_string().contains("sandbox state missing"));
     }
 
@@ -2784,7 +2859,8 @@ mod tests {
         // which depends on the global config. In unit tests without a real
         // config, it succeeds because the cache init may fail gracefully.
         // The key thing is it doesn't panic.
-        let _ = super::validate_start_state(&config, &sandbox_dir);
+        let backend = crate::backend::LocalBackend::lazy();
+        let _ = super::validate_start_state(&backend, &config, &sandbox_dir);
     }
 
     /// Simulates the reaper sweep: queries all Running/Draining sandboxes and

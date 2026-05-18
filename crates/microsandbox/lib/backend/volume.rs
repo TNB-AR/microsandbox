@@ -241,7 +241,10 @@ impl VolumeBackend for LocalBackend {
     }
 
     fn remove<'a>(&'a self, name: &'a str) -> BoxFuture<'a, MicrosandboxResult<()>> {
-        Box::pin(async move { crate::volume::remove_local(name).await })
+        Box::pin(async move {
+            let backend: Arc<dyn Backend> = crate::backend::default_backend();
+            crate::volume::remove_local(backend, name).await
+        })
     }
 
     fn fs_read<'a>(

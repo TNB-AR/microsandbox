@@ -200,7 +200,11 @@ impl Volume {
 
 impl VolumeHandle {
     /// Build a handle from a local volume DB row.
-    pub(crate) fn from_local_model(backend: Arc<dyn Backend>, model: volume_entity::Model) -> Self {
+    pub(crate) fn from_local_model(
+        local_backend: &crate::backend::LocalBackend,
+        backend: Arc<dyn Backend>,
+        model: volume_entity::Model,
+    ) -> Self {
         let labels = model
             .labels
             .as_deref()
@@ -212,7 +216,7 @@ impl VolumeHandle {
             })
             .unwrap_or_default();
 
-        let path = crate::config::config().volumes_dir().join(&model.name);
+        let path = local_backend.volume_path(&model.name);
         let name = model.name;
         Self {
             backend,
@@ -386,7 +390,13 @@ pub(crate) async fn create_local(
     tracing::debug!(name = %config.name, quota_mib = ?config.quota_mib, "Volume::create");
     validate_volume_name(&config.name)?;
 
-    let pools = crate::db::init_global().await?;
+    let local_backend = backend
+        .as_local()
+        .ok_or_else(|| MicrosandboxError::Unsupported {
+            feature: "Volume::create_local".into(),
+            available_when: "with a LocalBackend".into(),
+        })?;
+    let pools = local_backend.db().await?;
 
     // Check for existing volume.
     let existing = volume_entity::Entity::find()
@@ -422,8 +432,7 @@ pub(crate) async fn create_local(
         .await?;
 
     // Create the volume directory. If this fails, clean up the DB record.
-    let volumes_dir = crate::config::config().volumes_dir();
-    let path = volumes_dir.join(&config.name);
+    let path = local_backend.volume_path(&config.name);
 
     if let Err(e) = tokio::fs::create_dir_all(&path).await {
         let _ = volume_entity::Entity::delete_many()
@@ -446,7 +455,13 @@ pub(crate) async fn get_local(
     backend: Arc<dyn Backend>,
     name: &str,
 ) -> MicrosandboxResult<VolumeHandle> {
-    let db = crate::db::init_global().await?.read();
+    let local_backend = backend
+        .as_local()
+        .ok_or_else(|| MicrosandboxError::Unsupported {
+            feature: "Volume::get_local".into(),
+            available_when: "with a LocalBackend".into(),
+        })?;
+    let db = local_backend.db().await?.read();
 
     let model = volume_entity::Entity::find()
         .filter(volume_entity::Column::Name.eq(name))
@@ -454,12 +469,19 @@ pub(crate) async fn get_local(
         .await?
         .ok_or_else(|| MicrosandboxError::VolumeNotFound(name.into()))?;
 
-    Ok(VolumeHandle::from_local_model(backend, model))
+    let handle = VolumeHandle::from_local_model(local_backend, backend.clone(), model);
+    Ok(handle)
 }
 
 /// Local list path. Returns all volumes ordered newest-first.
 pub(crate) async fn list_local(backend: Arc<dyn Backend>) -> MicrosandboxResult<Vec<VolumeHandle>> {
-    let db = crate::db::init_global().await?.read();
+    let local_backend = backend
+        .as_local()
+        .ok_or_else(|| MicrosandboxError::Unsupported {
+            feature: "Volume::list_local".into(),
+            available_when: "with a LocalBackend".into(),
+        })?;
+    let db = local_backend.db().await?.read();
 
     let models = volume_entity::Entity::find()
         .order_by_desc(volume_entity::Column::CreatedAt)
@@ -468,13 +490,19 @@ pub(crate) async fn list_local(backend: Arc<dyn Backend>) -> MicrosandboxResult<
 
     Ok(models
         .into_iter()
-        .map(|m| VolumeHandle::from_local_model(backend.clone(), m))
+        .map(|m| VolumeHandle::from_local_model(local_backend, backend.clone(), m))
         .collect())
 }
 
 /// Local remove path. Deletes the DB record first, then the directory.
-pub(crate) async fn remove_local(name: &str) -> MicrosandboxResult<()> {
-    let pools = crate::db::init_global().await?;
+pub(crate) async fn remove_local(backend: Arc<dyn Backend>, name: &str) -> MicrosandboxResult<()> {
+    let local_backend = backend
+        .as_local()
+        .ok_or_else(|| MicrosandboxError::Unsupported {
+            feature: "Volume::remove_local".into(),
+            available_when: "with a LocalBackend".into(),
+        })?;
+    let pools = local_backend.db().await?;
 
     let model = volume_entity::Entity::find()
         .filter(volume_entity::Column::Name.eq(name))
@@ -486,7 +514,7 @@ pub(crate) async fn remove_local(name: &str) -> MicrosandboxResult<()> {
         .exec(pools.write())
         .await?;
 
-    let path = crate::config::config().volumes_dir().join(name);
+    let path = local_backend.volume_path(name);
     if path.exists() {
         tokio::fs::remove_dir_all(&path).await?;
     }

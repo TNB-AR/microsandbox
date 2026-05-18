@@ -340,7 +340,7 @@ async fn remove(args: SnapshotRemoveArgs) -> anyhow::Result<()> {
 async fn reindex(args: SnapshotReindexArgs) -> anyhow::Result<()> {
     let dir = args
         .dir
-        .unwrap_or_else(|| microsandbox::config::config().snapshots_dir());
+        .unwrap_or_else(|| microsandbox::LocalBackend::ambient().snapshots_dir());
     let n = Snapshot::reindex(&dir).await?;
     println!("indexed {n} snapshot(s) from {}", dir.display());
     Ok(())
