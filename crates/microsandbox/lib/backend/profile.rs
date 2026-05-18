@@ -1,7 +1,6 @@
 //! Backend selection: profile + env + config-file resolution.
 //!
-//! Implements the precedence ladder from
-//! `msb-cloud/plans/sdk-cloud-parity-plan.md` Q1:
+//! Precedence ladder (each tier wins over the one below):
 //!
 //! 1. Programmatic: explicit `.backend(b)` on a builder or
 //!    `microsandbox::set_default_backend(...)` — handled by the caller, not here.

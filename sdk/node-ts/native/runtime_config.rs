@@ -12,8 +12,7 @@ pub fn set_runtime_msb_path(path: String) {
 ///
 /// Process-level setter — one dylib per process address space, so this is the
 /// natural granularity. User env (`MSB_LIBKRUNFW_PATH`) still wins as tier 1.
-/// Mirrors `setRuntimeMsbPath` for libkrunfw. See msb-cloud's
-/// sdk-cloud-parity-plan.md D6.6.
+/// Mirrors `setRuntimeMsbPath` for libkrunfw.
 #[napi(js_name = "setRuntimeLibkrunfwPath")]
 pub fn set_runtime_libkrunfw_path(path: String) {
     microsandbox::config::set_sdk_libkrunfw_path(path);

@@ -14,7 +14,7 @@ which matches the wheel bundle layout. To override it, set the
 ``MSB_LIBKRUNFW_PATH`` env var (highest precedence) or call
 ``microsandbox.set_libkrunfw_path(...)`` once at startup. libkrunfw is a
 process-level concern (one dylib per process address space), so per-sandbox
-overrides aren't supported — see msb-cloud's sdk-cloud-parity-plan.md D6.6.
+overrides aren't supported.
 """
 
 from __future__ import annotations

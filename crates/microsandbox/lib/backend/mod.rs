@@ -15,9 +15,9 @@
 //! [`LocalBackend::lazy`]. [`with_backend`] scopes an override to one async
 //! future (and any tasks it spawns) via `tokio::task_local!`.
 //!
-//! See `msb-cloud/plans/sdk-cloud-parity-plan.md` D6 for the locked decisions
-//! and `planning/microsandbox/design/api/local-cloud-backend.md` for the
-//! full trait-surface spec.
+//! See `planning/microsandbox/design/api/local-cloud-backend.md` for the
+//! full trait-surface spec, and `planning/microsandbox/design/api/ambient-backend.md`
+//! for the resolution ladder + process-level config story.
 
 mod cloud;
 mod cloud_wire;

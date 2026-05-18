@@ -185,12 +185,13 @@ pub enum MicrosandboxError {
     InvalidCursor(String),
 
     /// A backend does not support a requested SDK feature yet.
-    #[error("{feature} is not supported by this backend yet; available in {available_in_phase}")]
+    #[error("{feature} is not supported by this backend yet; available {available_when}")]
     Unsupported {
         /// Feature requested by the caller.
         feature: String,
-        /// Phase or dependency that unlocks support.
-        available_in_phase: String,
+        /// Human-readable note describing what unlocks support (e.g. "when cloud
+        /// volumes ship", "when the rlimits API lands on the cloud").
+        available_when: String,
     },
 
     /// A custom error message.

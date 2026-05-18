@@ -885,15 +885,15 @@ impl SandboxBuilder {
 // Functions
 //--------------------------------------------------------------------------------------------------
 
-/// Maximum length of a sandbox name. Mirrors D12 of msb-cloud's `sdk-cloud-parity-plan.md`.
+/// Maximum length of a sandbox name.
 /// Must stay in sync with msb-cloud's `MAX_SANDBOX_NAME_LEN` in `msb-api/src/validators/sandbox.rs`.
 const MAX_SANDBOX_NAME_LEN: usize = 128;
 
-/// Validate that a sandbox name is safe and matches the cross-repo D12 rule:
-/// alphanumeric / dot / hyphen / underscore, 1..=128 chars, must start alphanumeric.
+/// Validate that a sandbox name is safe: alphanumeric / dot / hyphen / underscore,
+/// 1..=128 chars, must start alphanumeric.
 ///
 /// **Must stay in sync with msb-cloud's `validate_sandbox_name`.** The rule lives
-/// in two places by D12's choice; if the rule changes here, change it there too.
+/// in two places; if it changes here, change it there too.
 pub fn validate_sandbox_name(name: &str) -> MicrosandboxResult<()> {
     if name.is_empty() {
         return Err(crate::MicrosandboxError::InvalidConfig(
@@ -1395,7 +1395,7 @@ mod tests {
     }
 
     //----------------------------------------------------------------------------------------------
-    // Sandbox name validation (D12)
+    // Sandbox name validation
     //----------------------------------------------------------------------------------------------
 
     use super::{MAX_SANDBOX_NAME_LEN, validate_sandbox_name};

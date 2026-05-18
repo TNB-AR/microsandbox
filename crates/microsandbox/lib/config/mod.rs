@@ -625,8 +625,8 @@ pub fn config() -> &'static GlobalConfig {
 
 /// Resolve the path to the persisted global config file.
 pub fn config_path() -> PathBuf {
-    // Honour MSB_CONFIG_PATH if set (D6.7) — same env var the SDK config loader
-    // checks. The GlobalConfig and the new SdkConfig live in the same JSON
+    // Honour MSB_CONFIG_PATH if set — same env var the SDK config loader
+    // checks. The GlobalConfig and the SdkConfig live in the same JSON
     // document, so both layers must agree on the path.
     if let Ok(p) = std::env::var("MSB_CONFIG_PATH") {
         return PathBuf::from(p);

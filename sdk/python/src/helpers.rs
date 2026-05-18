@@ -167,10 +167,9 @@ pub fn sandbox_builder_from_args(
     if let Some(hostname) = extract_opt::<String>(kwargs, "hostname")? {
         builder = builder.hostname(hostname);
     }
-    // `libkrunfw_path` is no longer a per-sandbox builder kwarg — it's a
-    // process-level concern (one dylib per process address space). Users set
-    // it once via `microsandbox.set_libkrunfw_path(...)` or the
-    // `MSB_LIBKRUNFW_PATH` env var. See msb-cloud's sdk-cloud-parity-plan.md D6.6.
+    // `libkrunfw_path` is a process-level concern (one dylib per process
+    // address space), not a per-sandbox builder kwarg. Users set it once via
+    // `microsandbox.set_libkrunfw_path(...)` or the `MSB_LIBKRUNFW_PATH` env var.
     if let Some(user) = extract_opt::<String>(kwargs, "user")? {
         builder = builder.user(user);
     }

@@ -214,22 +214,37 @@ impl SandboxBackend for CloudBackend {
 fn cloud_create_request_from_config(
     config: SandboxConfig,
 ) -> MicrosandboxResult<CloudCreateSandboxRequest> {
-    reject_cloud_deferred(!config.mounts.is_empty(), "mounts", "Phase 6 (volumes)")?;
-    reject_cloud_deferred(!config.patches.is_empty(), "patches", "Phase 6")?;
+    reject_cloud_deferred(
+        !config.mounts.is_empty(),
+        "mounts",
+        "when cloud volumes ship",
+    )?;
+    reject_cloud_deferred(
+        !config.patches.is_empty(),
+        "patches",
+        "when cloud volumes ship",
+    )?;
     reject_cloud_deferred(
         !config.rlimits.is_empty(),
         "rlimits",
-        "D13 rlimits expansion",
+        "when rlimits land on the cloud API",
     )?;
-    reject_cloud_deferred(config.cmd.is_some(), "cmd", "D13 cmd expansion")?;
+    reject_cloud_deferred(
+        config.cmd.is_some(),
+        "cmd",
+        "when cmd lands on the cloud API",
+    )?;
 
     let image = match config.image {
         RootfsSource::Oci(image) => image,
         RootfsSource::Bind(_) => {
-            return Err(unsupported("image-from-host-dir", "Phase 6"));
+            return Err(unsupported(
+                "image-from-host-dir",
+                "when cloud volumes ship",
+            ));
         }
         RootfsSource::DiskImage { .. } => {
-            return Err(unsupported("disk-image rootfs", "D4: cloud-unsupported v1"));
+            return Err(unsupported("disk-image rootfs", "never on cloud"));
         }
     };
 
@@ -255,18 +270,18 @@ fn cloud_create_request_from_config(
 fn reject_cloud_deferred(
     present: bool,
     feature: &'static str,
-    available_in_phase: &'static str,
+    available_when: &'static str,
 ) -> MicrosandboxResult<()> {
     if present {
-        return Err(unsupported(feature, available_in_phase));
+        return Err(unsupported(feature, available_when));
     }
     Ok(())
 }
 
-fn unsupported(feature: &'static str, available_in_phase: &'static str) -> MicrosandboxError {
+fn unsupported(feature: &'static str, available_when: &'static str) -> MicrosandboxError {
     MicrosandboxError::Unsupported {
         feature: feature.into(),
-        available_in_phase: available_in_phase.into(),
+        available_when: available_when.into(),
     }
 }
 

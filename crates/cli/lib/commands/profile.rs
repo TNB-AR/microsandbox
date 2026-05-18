@@ -5,9 +5,8 @@
 //! or cloud) and, for cloud, provides a URL + an `api_key_ref` (env / inline /
 //! keyring — see `microsandbox::Profile`).
 //!
-//! Implements D11 of `msb-cloud/plans/sdk-cloud-parity-plan.md`: the CLI
-//! inherits backend selection from the SDK; the only CLI-side additions are
-//! `msb profile list / use / show`.
+//! The CLI inherits backend selection from the SDK; profile management is the
+//! only CLI-side surface (`msb profile list / use / show`).
 
 use anyhow::{Context, Result};
 use clap::{Args, Subcommand};

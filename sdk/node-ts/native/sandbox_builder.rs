@@ -278,10 +278,9 @@ impl JsSandboxBuilder {
         self
     }
 
-    // `libkrunfwPath` is no longer a per-sandbox builder method — it's a
-    // process-level concern (one dylib per process address space). Users set
-    // it once via `microsandbox.setLibkrunfwPath(...)` or the
-    // `MSB_LIBKRUNFW_PATH` env var. See msb-cloud's sdk-cloud-parity-plan.md D6.6.
+    // `libkrunfwPath` is a process-level concern (one dylib per process
+    // address space), not a per-sandbox builder method. Users set it once via
+    // `microsandbox.setLibkrunfwPath(...)` or the `MSB_LIBKRUNFW_PATH` env var.
 
     /// Default running user.
     #[napi]

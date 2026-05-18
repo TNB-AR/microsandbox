@@ -4,9 +4,9 @@
 //! implementations (sandbox lifecycle, exec, volumes, …) land alongside the
 //! `Backend` trait's sub-trait surface as that surface is filled in.
 //!
-//! See `msb-cloud/plans/sdk-cloud-parity-plan.md` D6.3 for the construction
-//! contract (URL + API key first; profile and env are sugar) and D10 for the
-//! API-key-only auth surface.
+//! Construction is URL + API key first; `from_env` and `from_profile` are sugar.
+//! Auth is API-key-only — the same `msb_live_*` / `msb_test_*` tokens msb-cloud
+//! issues today. No OAuth or session credentials are honored here.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -37,9 +37,9 @@ fn default_user_agent() -> String {
 
 /// Cloud-runtime backend: talks to an msb-cloud control plane over HTTP.
 ///
-/// Holds the deployment URL and API key (the (url, api_key) pair determines
-/// which org's view the backend sees — see D8: msb-cloud derives the org from
-/// the API key, no per-call org argument).
+/// Holds the deployment URL and API key. The `(url, api_key)` pair determines
+/// which org's view the backend sees: msb-cloud derives the org from the API
+/// key, so there is no per-call org argument.
 ///
 /// Constructors:
 /// - [`CloudBackend::new`] — primary; explicit URL + key. Works for hosted SaaS,
@@ -123,11 +123,10 @@ impl CloudBackend {
 }
 
 //--------------------------------------------------------------------------------------------------
-// Methods: Sandbox lifecycle (Phase 4 MVP)
+// Methods: Sandbox lifecycle
 //
 // HTTP dispatch for the SDK's sandbox lifecycle ops, hitting msb-cloud's
-// API-key-authenticated routes (`/v1/sandboxes/*` and `/v1/sandboxes/by-name/*`
-// — the latter exists per D7 / Phase 3.5).
+// API-key-authenticated routes (`/v1/sandboxes/*` and `/v1/sandboxes/by-name/*`).
 //--------------------------------------------------------------------------------------------------
 
 impl CloudBackend {

@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 /// Wire shape of `POST /v1/sandboxes` request body.
 ///
 /// **Must stay in sync** with msb-cloud's `CreateSandboxRequest` in
-/// `crates/msb-models/src/sandbox.rs`. D13 expansion fields are included.
+/// `crates/msb-models/src/sandbox.rs`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CloudCreateSandboxRequest {
@@ -39,7 +39,7 @@ pub struct CloudCreateSandboxRequest {
     /// Whether the sandbox should be removed when its allocation terminates.
     pub ephemeral: bool,
 
-    // D13 expansion fields.
+    // Optional config fields.
     /// Working directory inside the guest.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workdir: Option<String>,
@@ -207,7 +207,7 @@ mod tests {
         assert_eq!(json["vcpus"], 1);
         assert_eq!(json["memory_mib"], 512);
         assert_eq!(json["ephemeral"], true);
-        // Optional D13 fields elided when unset.
+        // Optional fields elided when unset.
         assert!(json.get("workdir").is_none());
         assert!(json.get("entrypoint").is_none());
         assert!(json.get("max_duration_secs").is_none());

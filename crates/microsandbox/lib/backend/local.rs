@@ -4,8 +4,6 @@
 //! Backend trait + sub-traits are filled in. The migration plan moves the
 //! contents of `crate::config::GlobalConfig` and `crate::db::init_global`
 //! into this struct's fields as each call site is converted.
-//!
-//! See `msb-cloud/plans/sdk-cloud-parity-plan.md` D6 + D6.7.
 
 use std::sync::Arc;
 

@@ -76,7 +76,7 @@ fn set_runtime_msb_path(path: String) {
 ///
 /// Process-level setter — one dylib per process address space, so this is the
 /// natural granularity. User env (`MSB_LIBKRUNFW_PATH`) still wins. Mirrors
-/// `set_runtime_msb_path` for libkrunfw. See sdk-cloud-parity-plan.md D6.6.
+/// `set_runtime_msb_path` for libkrunfw.
 #[pyfunction]
 fn set_runtime_libkrunfw_path(path: String) {
     microsandbox::config::set_sdk_libkrunfw_path(path);
