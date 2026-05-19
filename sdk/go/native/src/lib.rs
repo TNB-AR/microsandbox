@@ -1889,7 +1889,7 @@ pub unsafe extern "C" fn msb_sandbox_lookup(
             let h = Sandbox::get(&name).await.map_err(FfiError::from)?;
             Ok(serde_json::json!({
                 "name": h.name(),
-                "status": sandbox_status_str(h.status()),
+                "status": sandbox_status_str(h.status_snapshot()),
                 "config_json": h.config_json(),
                 "created_at_unix": h.created_at().map(|t| t.timestamp()),
                 "updated_at_unix": h.updated_at().map(|t| t.timestamp()),
@@ -2227,7 +2227,7 @@ fn sandbox_handle_json(h: &microsandbox::sandbox::SandboxHandle) -> String {
     format!(
         r#"{{"name":{name},"status":"{status}","config_json":{config},"created_at_unix":{created},"updated_at_unix":{updated}}}"#,
         name = name_json,
-        status = sandbox_status_str(h.status()),
+        status = sandbox_status_str(h.status_snapshot()),
         config = cfg_json,
     )
 }

@@ -768,8 +768,14 @@ impl Sandbox {
     /// Remove this sandbox's persisted state after it has fully stopped.
     ///
     /// Local backend only. Cloud sandboxes are removed via
-    /// [`Sandbox::remove`] / the backend trait's `remove` method.
-    pub async fn remove_persisted(self) -> MicrosandboxResult<()> {
+    /// [`Sandbox::remove`] / the backend trait's `remove` method (calling
+    /// this on a cloud sandbox returns `Unsupported` without performing any
+    /// work).
+    ///
+    /// Takes `&self` so the caller retains ownership across an
+    /// `Unsupported` error on cloud — the previous `self`-by-value
+    /// signature consumed the sandbox even on the failing path.
+    pub async fn remove_persisted(&self) -> MicrosandboxResult<()> {
         let local = self.require_local("remove_persisted")?;
         let local_backend =
             self.backend
@@ -846,6 +852,11 @@ impl Sandbox {
     /// Live status from the backend. Always hits `backend.sandboxes().get(name)`
     /// — there is no cached status on the outer struct, per the D6.4
     /// "fetch-live" policy.
+    ///
+    /// Each call is a separate round-trip (DB read for local, HTTP GET for
+    /// cloud). If you need to read multiple fields together (e.g. status +
+    /// last_error), call [`Sandbox::get`](Self::get) once and read off the
+    /// returned [`SandboxHandle`]'s `*_snapshot` accessors instead.
     pub async fn status(&self) -> MicrosandboxResult<SandboxStatus> {
         let handle = self
             .backend
@@ -857,6 +868,10 @@ impl Sandbox {
 
     /// Live last-error string from the backend, when any. Always hits the
     /// backend, never reads a cached field.
+    ///
+    /// Each call is a separate round-trip. If you need this alongside
+    /// `status()`, fetch a fresh [`SandboxHandle`] via
+    /// [`Sandbox::get`](Self::get) once and read both off the snapshot.
     pub async fn last_error(&self) -> MicrosandboxResult<Option<String>> {
         let handle = self
             .backend

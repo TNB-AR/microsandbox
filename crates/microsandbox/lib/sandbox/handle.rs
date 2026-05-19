@@ -66,11 +66,19 @@ impl SandboxHandle {
     }
 
     /// Build a handle from a [`CloudSandbox`] HTTP response.
-    pub(crate) fn from_cloud(backend: Arc<dyn Backend>, cloud: CloudSandbox) -> Self {
+    ///
+    /// Returns an error if `cloud.config` cannot be re-serialised to JSON for
+    /// the `config_json()` view. Silent fallback to an empty string here would
+    /// surface later as a confusing `serde_json::Error` ("EOF while parsing")
+    /// out of [`config()`](Self::config) / [`config_json()`](Self::config_json).
+    pub(crate) fn from_cloud(
+        backend: Arc<dyn Backend>,
+        cloud: CloudSandbox,
+    ) -> MicrosandboxResult<Self> {
         let status = crate::backend::sandbox::cloud_status_to_sandbox_status(cloud.status);
-        let config_json = serde_json::to_string(&cloud.config).unwrap_or_default();
+        let config_json = serde_json::to_string(&cloud.config)?;
         let name = cloud.name.clone();
-        Self {
+        Ok(Self {
             backend,
             inner: SandboxHandleInner::Cloud(SandboxHandleCloudState {
                 id: cloud.id,
@@ -83,7 +91,7 @@ impl SandboxHandle {
                 last_error: cloud.last_error,
             }),
             name,
-        }
+        })
     }
 
     /// Unique name identifying this sandbox.
@@ -116,17 +124,25 @@ impl SandboxHandle {
     ///
     /// **Not live** — call [`Sandbox::status`](super::Sandbox::status) on the
     /// live `Sandbox` (or re-fetch via [`Sandbox::get`](super::Sandbox::get))
-    /// for a fresh reading.
+    /// for a fresh reading. The `_snapshot` suffix is deliberate to avoid
+    /// confusion with `Sandbox::status()` which is async + fetch-live.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let handle = Sandbox::get("agent-1").await?;
+    /// // Cheap, in-memory; reflects state at handle-creation time.
+    /// let snap = handle.status_snapshot();
+    ///
+    /// // For a fresh reading, drive through the live Sandbox:
+    /// let sb = handle.start().await?;
+    /// let live = sb.status().await?;
+    /// ```
     pub fn status_snapshot(&self) -> SandboxStatus {
         match &self.inner {
             SandboxHandleInner::Local(s) => s.status,
             SandboxHandleInner::Cloud(s) => s.status,
         }
-    }
-
-    /// Snapshot of the sandbox status (alias for [`status_snapshot`](Self::status_snapshot)).
-    pub fn status(&self) -> SandboxStatus {
-        self.status_snapshot()
     }
 
     /// Snapshot of the cloud `last_error`, if any. Returns `None` for local
@@ -174,13 +190,17 @@ impl SandboxHandle {
         }
     }
 
-    /// When this sandbox's database record was last modified. Local handles
-    /// only — cloud handles surface `started_at` / `stopped_at` instead via
-    /// [`cloud`](Self::cloud).
+    /// Best-effort "last activity" timestamp.
+    ///
+    /// - Local: the database row's `updated_at` (modification time of the
+    ///   persisted record).
+    /// - Cloud: the most recent of `stopped_at` / `started_at` / `created_at`
+    ///   from the msb-cloud response. msb-cloud has no dedicated
+    ///   `updated_at` column, so this is synthesised on the client.
     pub fn updated_at(&self) -> Option<chrono::DateTime<chrono::Utc>> {
         match &self.inner {
             SandboxHandleInner::Local(s) => s.updated_at,
-            SandboxHandleInner::Cloud(_) => None,
+            SandboxHandleInner::Cloud(s) => s.stopped_at.or(s.started_at).or(s.created_at),
         }
     }
 

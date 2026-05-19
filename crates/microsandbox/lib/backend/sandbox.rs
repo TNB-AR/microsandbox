@@ -116,6 +116,14 @@ pub struct SandboxList {
 pub trait SandboxBackend: Send + Sync {
     /// Create a sandbox. The returned outer [`Sandbox`] carries the supplied
     /// `backend` Arc and the variant-specific state inside `SandboxInner`.
+    ///
+    /// `start` controls whether the sandbox is booted as part of create.
+    /// **Cloud honours `start`** (forwards it as `?start=true|false` on the
+    /// create request). **Local always boots immediately** — the local impl
+    /// ignores the flag, because libkrun has no equivalent "create-without-
+    /// start" state. This asymmetry is intentional per the SDK parity plan
+    /// (D6.4); callers that need a stopped local sandbox should create then
+    /// `stop()` it explicitly.
     fn create<'a>(
         &'a self,
         backend: Arc<dyn Backend>,
@@ -364,7 +372,7 @@ impl SandboxBackend for CloudBackend {
     ) -> BoxFuture<'a, MicrosandboxResult<SandboxHandle>> {
         Box::pin(async move {
             let cloud = CloudBackend::get_sandbox(self, name).await?;
-            Ok(SandboxHandle::from_cloud(backend, cloud))
+            SandboxHandle::from_cloud(backend, cloud)
         })
     }
 
@@ -380,7 +388,7 @@ impl SandboxBackend for CloudBackend {
                 .data
                 .into_iter()
                 .map(|sb| SandboxHandle::from_cloud(backend.clone(), sb))
-                .collect();
+                .collect::<MicrosandboxResult<Vec<_>>>()?;
             Ok(SandboxList {
                 sandboxes,
                 next_cursor: page.next_cursor,
@@ -460,8 +468,16 @@ pub(crate) fn cloud_status_to_sandbox_status(s: CloudSandboxStatus) -> SandboxSt
 /// Synthesize a [`SandboxConfig`] from a [`CloudSandbox`] response. Used when
 /// the SDK didn't drive the create call (e.g. `start(name)` returns a
 /// `Sandbox` for a sandbox the cloud created earlier).
+///
+/// Maps every field that exists on the cloud wire shape
+/// ([`CloudCreateSandboxRequest`]). Fields with no cloud counterpart are
+/// filled from [`SandboxConfig::default()`] via the `..Default::default()`
+/// spread — see inline comments for the synthesized defaults so a caller
+/// inspecting `sb.config()` after `Sandbox::start(name)` can reason about
+/// which fields are "live" vs. "synthesized stub".
 fn sandbox_config_from_cloud(cloud: &CloudSandbox) -> SandboxConfig {
     let mut config = SandboxConfig {
+        // --- Mapped from cloud wire (CloudCreateSandboxRequest) ---
         name: cloud.config.name.clone(),
         image: RootfsSource::Oci(cloud.config.image.clone()),
         cpus: cloud.config.vcpus,
@@ -473,11 +489,48 @@ fn sandbox_config_from_cloud(cloud: &CloudSandbox) -> SandboxConfig {
         hostname: cloud.config.hostname.clone(),
         user: cloud.config.user.clone(),
         scripts: cloud.config.scripts.clone(),
+        log_level: cloud
+            .config
+            .log_level
+            .as_deref()
+            .and_then(cloud_log_level_to_local),
+        // --- Synthesized defaults: no cloud counterpart yet ---
+        // The fields below are filled from `SandboxConfig::default()` via the
+        // `..Default::default()` spread because the cloud wire shape doesn't
+        // carry them (D13). Surfacing them as defaults rather than panicking
+        // keeps `sb.config()` total, but callers should not treat these as
+        // authoritative for a cloud sandbox:
+        //   - metrics_sample_interval_ms / disable_metrics_sample (cloud
+        //     metrics are not yet exposed through the SDK config surface)
+        //   - mounts / patches / rlimits (cloud volumes deferred)
+        //   - cmd (cloud cmd override deferred)
+        //   - init (cloud handoff init deferred)
+        //   - pull_policy / registry_auth / insecure / ca_certs (cloud
+        //     manages image pulls server-side)
+        //   - replace_existing / replace_with_grace (operation flags, not
+        //     persisted state)
+        //   - network (cloud networking deferred)
         ..Default::default()
     };
+    // policy lives in a sub-struct; spread above seeded a default policy,
+    // overlay the two timeout fields the cloud DOES expose.
     config.policy.max_duration_secs = cloud.config.max_duration_secs;
     config.policy.idle_timeout_secs = cloud.config.idle_timeout_secs;
     config
+}
+
+/// Parse the cloud wire `log_level` string back into a local [`LogLevel`].
+/// Unknown values map to `None` — better to drop than to misclassify.
+fn cloud_log_level_to_local(level: &str) -> Option<microsandbox_runtime::logging::LogLevel> {
+    use microsandbox_runtime::logging::LogLevel;
+    match level {
+        "error" => Some(LogLevel::Error),
+        "warn" => Some(LogLevel::Warn),
+        "info" => Some(LogLevel::Info),
+        "debug" => Some(LogLevel::Debug),
+        "trace" => Some(LogLevel::Trace),
+        _ => None,
+    }
 }
 
 pub(super) fn cloud_create_request_from_config(
@@ -750,6 +803,95 @@ mod tests {
             });
         let err = cloud_create_request_from_config(config).unwrap_err();
         assert!(matches!(err, MicrosandboxError::Unsupported { .. }));
+    }
+
+    #[test]
+    fn sandbox_config_from_cloud_round_trips_d13_fields() {
+        let cloud = CloudSandbox {
+            id: "00000000-0000-0000-0000-000000000002".into(),
+            org_id: "00000000-0000-0000-0000-000000000001".into(),
+            name: "agent-1".into(),
+            status: CloudSandboxStatus::Running,
+            config: CloudCreateSandboxRequest {
+                name: "agent-1".into(),
+                image: "python:3.12".into(),
+                vcpus: 4,
+                memory_mib: 2048,
+                env: [("A".to_string(), "B".to_string())].into_iter().collect(),
+                ephemeral: true,
+                workdir: Some("/app".into()),
+                shell: Some("/bin/bash".into()),
+                entrypoint: Some(vec!["python".into(), "-u".into()]),
+                hostname: Some("worker".into()),
+                user: Some("appuser".into()),
+                log_level: Some("debug".into()),
+                scripts: [("setup".to_string(), "echo hi".to_string())]
+                    .into_iter()
+                    .collect(),
+                max_duration_secs: Some(3600),
+                idle_timeout_secs: Some(600),
+            },
+            ephemeral: true,
+            created_at: chrono::Utc::now(),
+            started_at: None,
+            stopped_at: None,
+            last_error: None,
+        };
+
+        let config = sandbox_config_from_cloud(&cloud);
+
+        assert_eq!(config.name, "agent-1");
+        assert!(matches!(config.image, RootfsSource::Oci(ref s) if s == "python:3.12"));
+        assert_eq!(config.cpus, 4);
+        assert_eq!(config.memory_mib, 2048);
+        assert_eq!(
+            config.env,
+            vec![("A".to_string(), "B".to_string())],
+            "env round-trip"
+        );
+        assert_eq!(config.workdir.as_deref(), Some("/app"));
+        assert_eq!(config.shell.as_deref(), Some("/bin/bash"));
+        assert_eq!(
+            config.entrypoint,
+            Some(vec!["python".to_string(), "-u".to_string()])
+        );
+        assert_eq!(config.hostname.as_deref(), Some("worker"));
+        assert_eq!(config.user.as_deref(), Some("appuser"));
+        assert_eq!(
+            config.log_level,
+            Some(microsandbox_runtime::logging::LogLevel::Debug),
+            "log_level should round-trip via string mapping",
+        );
+        assert_eq!(config.scripts.get("setup"), Some(&"echo hi".to_string()));
+        assert_eq!(config.policy.max_duration_secs, Some(3600));
+        assert_eq!(config.policy.idle_timeout_secs, Some(600));
+    }
+
+    #[test]
+    fn sandbox_config_from_cloud_drops_unknown_log_level() {
+        let cloud = CloudSandbox {
+            id: "00000000-0000-0000-0000-000000000002".into(),
+            org_id: "00000000-0000-0000-0000-000000000001".into(),
+            name: "agent-1".into(),
+            status: CloudSandboxStatus::Running,
+            config: CloudCreateSandboxRequest {
+                name: "agent-1".into(),
+                image: "python:3.12".into(),
+                log_level: Some("verbose".into()),
+                ..Default::default()
+            },
+            ephemeral: true,
+            created_at: chrono::Utc::now(),
+            started_at: None,
+            stopped_at: None,
+            last_error: None,
+        };
+
+        let config = sandbox_config_from_cloud(&cloud);
+        assert!(
+            config.log_level.is_none(),
+            "unknown log_level should map to None"
+        );
     }
 
     #[test]
