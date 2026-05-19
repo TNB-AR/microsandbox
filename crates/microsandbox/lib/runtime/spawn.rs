@@ -29,7 +29,9 @@ use microsandbox_protocol::{
 use microsandbox_utils::{DB_FILENAME, DB_SUBDIR};
 
 use crate::{
-    MicrosandboxResult, config,
+    MicrosandboxResult,
+    backend::LocalBackend,
+    config,
     runtime::handle::ProcessHandle,
     sandbox::{DiskImageFormat, Rlimit, RootfsSource, SandboxConfig, VolumeMount},
 };
@@ -69,6 +71,7 @@ pub enum SpawnMode {
 /// 4. Spawns the hidden `msb sandbox` process with `--agent-sock` for the relay
 /// 5. Reads startup JSON from stdout to get child PIDs
 pub async fn spawn_sandbox(
+    local: &LocalBackend,
     config: &SandboxConfig,
     sandbox_id: i32,
     mode: SpawnMode,
@@ -77,8 +80,7 @@ pub async fn spawn_sandbox(
     // resolver consults MSB_LIBKRUNFW_PATH env, then SDK_LIBKRUNFW_PATH static,
     // then config.paths.libkrunfw, then filesystem fallbacks — see
     // `config::resolve_libkrunfw_path` for the full precedence ladder.
-    let backend = crate::backend::LocalBackend::ambient();
-    let global = backend.config();
+    let global = local.config();
     let msb_path = config::resolve_msb_path(global)?;
     let libkrunfw_path = config::resolve_libkrunfw_path(global)?;
     tracing::debug!(
@@ -127,6 +129,7 @@ pub async fn spawn_sandbox(
     // Build the command.
     let mut cmd = Command::new(&msb_path);
     cmd.args(sandbox_cli_args(
+        local,
         config,
         sandbox_id,
         &db_path,
@@ -488,6 +491,7 @@ fn guest_mount_tag(guest_path: &str) -> String {
 /// Build the `msb sandbox` CLI args for a sandbox.
 #[allow(clippy::too_many_arguments)]
 fn sandbox_cli_args(
+    local: &LocalBackend,
     config: &SandboxConfig,
     sandbox_id: i32,
     db_path: &Path,
@@ -551,13 +555,12 @@ fn sandbox_cli_args(
         RootfsSource::Oci(_) => {
             // Derive VMDK + upper paths from the stored manifest digest.
             if let Some(ref digest_str) = config.manifest_digest {
-                let backend = crate::backend::LocalBackend::ambient();
-                let cache_dir = backend.cache_dir();
+                let cache_dir = local.cache_dir();
                 let cache = GlobalCache::new(&cache_dir).expect("cache init");
                 let digest: Digest = digest_str.parse().expect("invalid manifest digest");
                 let vmdk_path = cache.vmdk_path(&digest);
 
-                let sandbox_dir = backend.sandboxes_dir().join(&config.name);
+                let sandbox_dir = local.sandboxes_dir().join(&config.name);
                 let upper_path = sandbox_dir.join("upper.ext4");
 
                 // VMDK (fsmeta + layers) as read-only block device.
@@ -626,7 +629,7 @@ fn sandbox_cli_args(
                 guest,
                 readonly,
             } => {
-                let vol_path = crate::backend::LocalBackend::ambient().volume_path(name);
+                let vol_path = local.volume_path(name);
                 push_dir_mount_arg(&mut args, guest, &vol_path.display(), *readonly);
                 push_dir_mounts_spec(&mut dir_mounts_val, guest, *readonly);
             }
@@ -784,6 +787,7 @@ mod tests {
     use super::sandbox_cli_args;
     use crate::{
         LogLevel,
+        backend::LocalBackend,
         sandbox::{
             DiskImageFormat, Rlimit, RlimitResource, RootfsSource, SandboxBuilder, SandboxConfig,
         },
@@ -793,8 +797,17 @@ mod tests {
     // Functions: Helpers
     //----------------------------------------------------------------------------------------------
 
+    /// Build a `LocalBackend` for tests. Uses `lazy()` since these tests only
+    /// exercise the pure-rendering `sandbox_cli_args` path — no DB / FS
+    /// touches.
+    fn test_local_backend() -> LocalBackend {
+        LocalBackend::lazy()
+    }
+
     fn render_args(config: &SandboxConfig) -> Vec<String> {
+        let local = test_local_backend();
         sandbox_cli_args(
+            &local,
             config,
             42,
             Path::new("/tmp/msb.db"),
@@ -814,7 +827,9 @@ mod tests {
         config: &SandboxConfig,
         staged_file_mounts: &HashMap<String, (PathBuf, String, String)>,
     ) -> Vec<String> {
+        let local = test_local_backend();
         sandbox_cli_args(
+            &local,
             config,
             42,
             Path::new("/tmp/msb.db"),
@@ -888,7 +903,9 @@ mod tests {
             .await
             .unwrap();
 
+        let local = test_local_backend();
         let args = sandbox_cli_args(
+            &local,
             &config,
             42,
             Path::new("/tmp/msb.db"),

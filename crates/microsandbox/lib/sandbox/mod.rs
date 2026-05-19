@@ -408,7 +408,9 @@ pub(crate) async fn create_local(
         if let Ok(image_ref) = reference.parse::<Reference>() {
             match cache.read_image_metadata_async(&image_ref).await {
                 Ok(Some(metadata)) => {
-                    if let Err(e) = crate::image::Image::persist(&reference, metadata).await {
+                    if let Err(e) =
+                        crate::image::Image::persist(local_backend, &reference, metadata).await
+                    {
                         tracing::warn!(
                             error = %e,
                             "failed to persist image metadata to database"
@@ -436,13 +438,14 @@ pub(crate) async fn create_local(
 
     // Spawn the sandbox process and create the bridge. On failure, mark the sandbox
     // as stopped so it doesn't appear as a phantom "Running" entry.
-    let (local_state, returned_config) = match create_inner_local(config, sandbox_id, mode).await {
-        Ok(pair) => pair,
-        Err(e) => {
-            let _ = update_sandbox_status(write_db, sandbox_id, SandboxStatus::Stopped).await;
-            return Err(e);
-        }
-    };
+    let (local_state, returned_config) =
+        match create_inner_local(local_backend, config, sandbox_id, mode).await {
+            Ok(pair) => pair,
+            Err(e) => {
+                let _ = update_sandbox_status(write_db, sandbox_id, SandboxStatus::Stopped).await;
+                return Err(e);
+            }
+        };
     let sandbox = Sandbox::from_local(backend.clone(), local_state, returned_config);
 
     if let (Some(_reference), Some(manifest_digest)) = (
@@ -512,7 +515,7 @@ pub(crate) async fn start_local(
     )?;
     update_sandbox_status(write_db, model.id, SandboxStatus::Running).await?;
 
-    match create_inner_local(config, model.id, mode).await {
+    match create_inner_local(local_backend, config, model.id, mode).await {
         Ok((local_state, returned_config)) => {
             Ok(Sandbox::from_local(backend, local_state, returned_config))
         }
@@ -526,11 +529,12 @@ pub(crate) async fn start_local(
 /// Inner local create logic separated for error-cleanup wrapper. Returns
 /// the local-variant state plus the (possibly mutated) config.
 async fn create_inner_local(
+    local: &crate::backend::LocalBackend,
     config: SandboxConfig,
     sandbox_id: i32,
     mode: SpawnMode,
 ) -> MicrosandboxResult<(crate::backend::SandboxLocalState, SandboxConfig)> {
-    let (mut handle, agent_sock_path) = spawn_sandbox(&config, sandbox_id, mode).await?;
+    let (mut handle, agent_sock_path) = spawn_sandbox(local, &config, sandbox_id, mode).await?;
 
     // Wait for the relay socket to become available.
     let client = wait_for_relay(&agent_sock_path, &mut handle, &config.name).await?;
@@ -785,7 +789,14 @@ impl Sandbox {
     /// in this delegation.
     pub fn logs(&self, opts: &LogOptions) -> MicrosandboxResult<Vec<LogEntry>> {
         self.require_local("logs")?;
-        logs::read_logs(self.name(), opts)
+        let local =
+            self.backend
+                .as_local()
+                .ok_or_else(|| crate::MicrosandboxError::Unsupported {
+                    feature: "Sandbox::logs on cloud".into(),
+                    available_when: "when cloud logs land".into(),
+                })?;
+        logs::read_logs(local, self.name(), opts)
     }
 
     /// Low-level access to the guest agent client. **Local backend only**.
@@ -1688,8 +1699,13 @@ pub(super) async fn update_sandbox_status(
 /// from updating the database on exit are cleaned up without blocking the
 /// main path.
 pub async fn reap_stale_sandboxes() -> MicrosandboxResult<()> {
-    let backend = crate::backend::LocalBackend::ambient();
-    let pools = backend.db().await?;
+    let backend = crate::backend::default_backend();
+    let local = match backend.as_local() {
+        Some(local) => local,
+        // No local backend installed — nothing to reap on this process.
+        None => return Ok(()),
+    };
+    let pools = local.db().await?;
 
     let stale = sandbox_entity::Entity::find()
         .filter(

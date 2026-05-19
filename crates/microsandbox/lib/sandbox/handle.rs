@@ -189,13 +189,14 @@ impl SandboxHandle {
     /// Same backing data as [`Sandbox::logs`](super::Sandbox::logs).
     /// Works without starting the sandbox. **Local handles only**.
     pub fn logs(&self, opts: &super::LogOptions) -> MicrosandboxResult<Vec<super::LogEntry>> {
-        if self.local().is_none() {
-            return Err(crate::MicrosandboxError::Unsupported {
-                feature: "SandboxHandle::logs on cloud".into(),
-                available_when: "when cloud logs land".into(),
-            });
-        }
-        super::logs::read_logs(&self.name, opts)
+        let local_backend =
+            self.backend
+                .as_local()
+                .ok_or_else(|| crate::MicrosandboxError::Unsupported {
+                    feature: "SandboxHandle::logs on cloud".into(),
+                    available_when: "when cloud logs land".into(),
+                })?;
+        super::logs::read_logs(local_backend, &self.name, opts)
     }
 
     /// Get the latest metrics snapshot for this sandbox. **Local handles only**.

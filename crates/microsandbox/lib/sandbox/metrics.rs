@@ -9,6 +9,7 @@ use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder};
 
 use crate::{
     MicrosandboxError, MicrosandboxResult,
+    backend::LocalBackend,
     db::entity::{sandbox as sandbox_entity, sandbox_metric as sandbox_metric_entity},
 };
 
@@ -142,9 +143,10 @@ impl Sandbox {
 //--------------------------------------------------------------------------------------------------
 
 /// Get the latest metrics snapshot for every running sandbox.
-pub async fn all_sandbox_metrics() -> MicrosandboxResult<HashMap<String, SandboxMetrics>> {
-    let backend = crate::backend::LocalBackend::ambient();
-    let pools = backend.db().await?;
+pub async fn all_sandbox_metrics(
+    local: &LocalBackend,
+) -> MicrosandboxResult<HashMap<String, SandboxMetrics>> {
+    let pools = local.db().await?;
     let db = pools.read();
     let sandboxes = sandbox_entity::Entity::find()
         .filter(

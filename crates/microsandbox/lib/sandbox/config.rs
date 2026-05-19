@@ -35,36 +35,32 @@ const DEFAULT_OCI_UPPER_SIZE_MIB: u32 = 4 * 1024;
 /// [`SandboxHandle::stop`]: super::SandboxHandle::stop
 pub const DEFAULT_REPLACE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+// Compile-time defaults for `SandboxConfig` serde. Serde's `#[serde(default
+// = "fn")]` attribute can't take parameters, so these can't consult a
+// `LocalBackend`. They intentionally mirror `LocalConfig::default()` /
+// `SandboxDefaults::default()` for the same fields, so DB-row
+// deserialization (and `sandbox_config_from_cloud`) are side-effect-free.
+// A `LocalBackend` with non-default sandbox defaults applies them through
+// `SandboxBuilder` at create time, not via serde.
+
 fn default_cpus() -> u8 {
-    crate::backend::LocalBackend::ambient()
-        .config()
-        .sandbox_defaults
-        .cpus
+    crate::config::DEFAULT_CPUS
 }
 
 fn default_memory_mib() -> u32 {
-    crate::backend::LocalBackend::ambient()
-        .config()
-        .sandbox_defaults
-        .memory_mib
+    crate::config::DEFAULT_MEMORY_MIB
 }
 
 fn default_log_level() -> Option<LogLevel> {
-    crate::backend::LocalBackend::ambient().config().log_level
+    None
 }
 
 fn default_metrics_sample_interval_ms() -> Option<NonZero<u64>> {
-    crate::backend::LocalBackend::ambient()
-        .config()
-        .sandbox_defaults
-        .metrics_sample_interval_ms
+    crate::config::default_metrics_sample_interval()
 }
 
 fn default_disable_metrics_sample() -> bool {
-    crate::backend::LocalBackend::ambient()
-        .config()
-        .sandbox_defaults
-        .disable_metrics_sample
+    false
 }
 
 //--------------------------------------------------------------------------------------------------

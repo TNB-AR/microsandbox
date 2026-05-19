@@ -16,7 +16,7 @@
 //! backends can hold different configurations for tests / migrations.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::Duration;
 
 use microsandbox_db::pool::DbPools;
@@ -30,21 +30,6 @@ use crate::config::{
     load_persisted_config_or_default,
 };
 use crate::{MicrosandboxError, MicrosandboxResult};
-
-//--------------------------------------------------------------------------------------------------
-// Statics
-//--------------------------------------------------------------------------------------------------
-
-/// Process-wide ambient `LocalBackend`. Lazily initialised by
-/// [`LocalBackend::ambient`] on first access. Holds the "no explicit setup"
-/// instance — the same `LocalBackend` the ambient `default_backend()` falls
-/// back to when nothing else is installed.
-///
-/// Code paths that cannot thread a `&LocalBackend` through their callers
-/// (serde defaults on `SandboxConfig`, CLI commands, FFI shims) consult this
-/// cell. Code paths that come in through a trait method receive an explicit
-/// `&LocalBackend` instead.
-static AMBIENT: OnceLock<Arc<LocalBackend>> = OnceLock::new();
 
 //--------------------------------------------------------------------------------------------------
 // Types
@@ -94,8 +79,11 @@ impl LocalBackend {
     /// hard-coded defaults. The DB pool is created (and migrations applied)
     /// on first call to [`Self::db`].
     ///
-    /// This is the ambient default — the same instance every call to
-    /// [`Self::ambient`] returns.
+    /// Process-wide singleton access goes through
+    /// [`default_backend()`](super::default_backend) +
+    /// [`Backend::as_local`]; the process default lazy-initialises a single
+    /// `LocalBackend` instance, so callers never end up with two backends
+    /// racing on the same SQLite file.
     pub fn lazy() -> Self {
         let config = Arc::new(load_persisted_config_or_default().unwrap_or_default());
         Self {
@@ -115,17 +103,6 @@ impl LocalBackend {
     /// Start a builder for programmatic configuration.
     pub fn builder() -> LocalBackendBuilder {
         LocalBackendBuilder::default()
-    }
-
-    /// Return the process-wide ambient `LocalBackend`. Lazily constructed on
-    /// first access via [`Self::lazy`]; subsequent calls return the same
-    /// `Arc`.
-    ///
-    /// This is the bridge for code paths that cannot thread a
-    /// `&LocalBackend` through their callers (serde defaults, FFI shims,
-    /// CLI helpers).
-    pub fn ambient() -> &'static Arc<LocalBackend> {
-        AMBIENT.get_or_init(|| Arc::new(LocalBackend::lazy()))
     }
 
     /// Access the open DB pool, initialising it (and applying migrations) on
@@ -396,6 +373,8 @@ mod tests {
     use sea_orm::{ConnectionTrait, Database, DatabaseBackend, Statement};
 
     use super::*;
+    use crate::backend::{VolumeBackend, with_backend};
+    use crate::volume::VolumeConfig;
 
     #[tokio::test]
     async fn test_connect_and_migrate_creates_db_and_tables() {
@@ -528,5 +507,85 @@ mod tests {
             .try_get_by_index::<i64>(0)
             .unwrap();
         assert_eq!(migration_row_count, 1);
+    }
+
+    /// Regression test for Defect 1: under `with_backend(custom_local, ...)`,
+    /// volume FS ops must route to the custom backend's `volumes_dir`, not
+    /// the resolved default's.
+    ///
+    /// Pre-fix, `volume::fs::local::*` reached into `LocalBackend::ambient()`
+    /// so a `with_backend` scope would write the DB row to the custom but
+    /// route filesystem ops to the ambient default. Two backends with
+    /// distinct `volumes_dir`s make the leak observable: writes through B's
+    /// trait impl must land under B's `volumes_dir`, not under A's.
+    #[tokio::test]
+    async fn with_backend_scope_isolates_volume_fs_paths() {
+        let home_a = tempfile::tempdir().unwrap();
+        let home_b = tempfile::tempdir().unwrap();
+
+        let backend_a: Arc<dyn Backend> = Arc::new(
+            LocalBackend::builder()
+                .home(home_a.path())
+                .build()
+                .await
+                .unwrap(),
+        );
+        let backend_b: Arc<dyn Backend> = Arc::new(
+            LocalBackend::builder()
+                .home(home_b.path())
+                .build()
+                .await
+                .unwrap(),
+        );
+
+        // Create the volume in backend B only.
+        backend_b
+            .volumes()
+            .create(
+                backend_b.clone(),
+                VolumeConfig {
+                    name: "vol".into(),
+                    quota_mib: None,
+                    labels: Vec::new(),
+                },
+            )
+            .await
+            .unwrap();
+
+        // Inside a `with_backend(B)` scope, write a file through B's trait.
+        // Without the fix, `fs_write` would re-resolve via the ambient
+        // `LocalBackend` and write to A (or to the global ambient).
+        let backend_b_clone = backend_b.clone();
+        with_backend(backend_a.clone(), async move {
+            backend_b_clone
+                .volumes()
+                .fs_write("vol", "hello.txt", b"world".to_vec())
+                .await
+                .unwrap();
+        })
+        .await;
+
+        // Expect the file under B's volumes_dir, not A's.
+        let expected_path = backend_b
+            .as_local()
+            .unwrap()
+            .volume_path("vol")
+            .join("hello.txt");
+        let unexpected_path = backend_a
+            .as_local()
+            .unwrap()
+            .volumes_dir()
+            .join("vol")
+            .join("hello.txt");
+
+        let contents = tokio::fs::read_to_string(&expected_path)
+            .await
+            .expect("file should exist under backend B's volumes_dir");
+        assert_eq!(contents, "world");
+        assert!(
+            !unexpected_path.exists(),
+            "file must NOT appear under backend A's volumes_dir; \
+             ambient() leak regressed"
+        );
     }
 }

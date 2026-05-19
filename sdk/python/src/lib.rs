@@ -138,7 +138,14 @@ fn default_backend_kind() -> &'static str {
 /// Intended as a test/diagnostic hook for verifying the Python-to-native bridge.
 #[pyfunction]
 fn resolved_msb_path() -> PyResult<String> {
-    microsandbox::config::resolve_msb_path(microsandbox::LocalBackend::ambient().config())
+    let backend = microsandbox::backend::default_backend();
+    let local = backend.as_local().ok_or_else(|| {
+        error::to_py_err(microsandbox::MicrosandboxError::Unsupported {
+            feature: "resolved_msb_path requires a local backend".into(),
+            available_when: "with a local backend".into(),
+        })
+    })?;
+    microsandbox::config::resolve_msb_path(local.config())
         .map(|path| path.to_string_lossy().into_owned())
         .map_err(error::to_py_err)
 }

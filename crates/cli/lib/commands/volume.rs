@@ -187,7 +187,9 @@ async fn inspect(args: VolumeInspectArgs) -> anyhow::Result<()> {
             .join(", ")
     };
 
-    let path = microsandbox::LocalBackend::ambient().volume_path(handle.name());
+    let backend = crate::commands::common::resolve_local_backend()?;
+    let local = crate::commands::common::local_backend_ref(&backend)?;
+    let path = local.volume_path(handle.name());
 
     ui::detail_kv("Name", handle.name());
     ui::detail_kv("Quota", &quota);

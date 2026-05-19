@@ -257,7 +257,7 @@ impl VolumeBackend for LocalBackend {
         name: &'a str,
         path: &'a str,
     ) -> BoxFuture<'a, MicrosandboxResult<Bytes>> {
-        Box::pin(async move { crate::volume::fs::local::read(name, path).await })
+        Box::pin(async move { crate::volume::fs::local::read(self, name, path).await })
     }
 
     fn fs_read_to_string<'a>(
@@ -265,7 +265,7 @@ impl VolumeBackend for LocalBackend {
         name: &'a str,
         path: &'a str,
     ) -> BoxFuture<'a, MicrosandboxResult<String>> {
-        Box::pin(async move { crate::volume::fs::local::read_to_string(name, path).await })
+        Box::pin(async move { crate::volume::fs::local::read_to_string(self, name, path).await })
     }
 
     fn fs_write<'a>(
@@ -274,7 +274,7 @@ impl VolumeBackend for LocalBackend {
         path: &'a str,
         data: Vec<u8>,
     ) -> BoxFuture<'a, MicrosandboxResult<()>> {
-        Box::pin(async move { crate::volume::fs::local::write(name, path, &data).await })
+        Box::pin(async move { crate::volume::fs::local::write(self, name, path, &data).await })
     }
 
     fn fs_list<'a>(
@@ -282,7 +282,7 @@ impl VolumeBackend for LocalBackend {
         name: &'a str,
         path: &'a str,
     ) -> BoxFuture<'a, MicrosandboxResult<Vec<FsEntry>>> {
-        Box::pin(async move { crate::volume::fs::local::list(name, path).await })
+        Box::pin(async move { crate::volume::fs::local::list(self, name, path).await })
     }
 
     fn fs_stat<'a>(
@@ -290,7 +290,7 @@ impl VolumeBackend for LocalBackend {
         name: &'a str,
         path: &'a str,
     ) -> BoxFuture<'a, MicrosandboxResult<FsMetadata>> {
-        Box::pin(async move { crate::volume::fs::local::stat(name, path).await })
+        Box::pin(async move { crate::volume::fs::local::stat(self, name, path).await })
     }
 
     fn fs_mkdir<'a>(
@@ -298,7 +298,7 @@ impl VolumeBackend for LocalBackend {
         name: &'a str,
         path: &'a str,
     ) -> BoxFuture<'a, MicrosandboxResult<()>> {
-        Box::pin(async move { crate::volume::fs::local::mkdir(name, path).await })
+        Box::pin(async move { crate::volume::fs::local::mkdir(self, name, path).await })
     }
 
     fn fs_remove<'a>(
@@ -306,7 +306,7 @@ impl VolumeBackend for LocalBackend {
         name: &'a str,
         path: &'a str,
     ) -> BoxFuture<'a, MicrosandboxResult<()>> {
-        Box::pin(async move { crate::volume::fs::local::remove(name, path).await })
+        Box::pin(async move { crate::volume::fs::local::remove(self, name, path).await })
     }
 
     fn fs_remove_dir<'a>(
@@ -314,7 +314,7 @@ impl VolumeBackend for LocalBackend {
         name: &'a str,
         path: &'a str,
     ) -> BoxFuture<'a, MicrosandboxResult<()>> {
-        Box::pin(async move { crate::volume::fs::local::remove_dir(name, path).await })
+        Box::pin(async move { crate::volume::fs::local::remove_dir(self, name, path).await })
     }
 
     fn fs_copy<'a>(
@@ -323,7 +323,7 @@ impl VolumeBackend for LocalBackend {
         from: &'a str,
         to: &'a str,
     ) -> BoxFuture<'a, MicrosandboxResult<()>> {
-        Box::pin(async move { crate::volume::fs::local::copy(name, from, to).await })
+        Box::pin(async move { crate::volume::fs::local::copy(self, name, from, to).await })
     }
 
     fn fs_rename<'a>(
@@ -332,7 +332,7 @@ impl VolumeBackend for LocalBackend {
         from: &'a str,
         to: &'a str,
     ) -> BoxFuture<'a, MicrosandboxResult<()>> {
-        Box::pin(async move { crate::volume::fs::local::rename(name, from, to).await })
+        Box::pin(async move { crate::volume::fs::local::rename(self, name, from, to).await })
     }
 
     fn fs_exists<'a>(
@@ -340,7 +340,7 @@ impl VolumeBackend for LocalBackend {
         name: &'a str,
         path: &'a str,
     ) -> BoxFuture<'a, MicrosandboxResult<bool>> {
-        Box::pin(async move { crate::volume::fs::local::exists(name, path).await })
+        Box::pin(async move { crate::volume::fs::local::exists(self, name, path).await })
     }
 }
 

@@ -16,7 +16,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use crate::backend::{Backend, BackendKind};
+use crate::backend::Backend;
 use crate::{
     MicrosandboxError, MicrosandboxResult,
     sandbox::fs::{FsEntry, FsMetadata},
@@ -208,13 +208,14 @@ impl VolumeFs<'_> {
     /// Used by streaming ops which need a direct host path and don't fit the
     /// boxed-future trait shape cleanly.
     fn require_local_path(&self, path: &str, feature: &str) -> MicrosandboxResult<PathBuf> {
-        if self.backend.kind() != BackendKind::Local {
-            return Err(MicrosandboxError::Unsupported {
+        let local = self
+            .backend
+            .as_local()
+            .ok_or_else(|| MicrosandboxError::Unsupported {
                 feature: feature.into(),
                 available_when: "when cloud streaming routes ship".into(),
-            });
-        }
-        let root = crate::backend::LocalBackend::ambient().volume_path(self.name);
+            })?;
+        let root = local.volume_path(self.name);
         local::resolve_relative(&root, path)
     }
 }
@@ -277,9 +278,10 @@ pub(crate) mod local {
     //! Local FS ops keyed by `(volume_name, rel_path)`.
     //!
     //! Lives in a sub-module so the `LocalBackend` trait impl in
-    //! `backend/volume.rs` can call into one place. Internally resolves
-    //! the path against the global `volumes_dir` config — moves into
-    //! `LocalBackend` fields when the globals are hoisted.
+    //! `backend/volume.rs` can call into one place. Each function takes
+    //! the `&LocalBackend` whose `volumes_dir` it should resolve against,
+    //! so `with_backend` scoping and explicit `LocalBackend::builder()`
+    //! constructions correctly route to the right host directory.
 
     use std::path::{Path, PathBuf};
 
@@ -287,6 +289,7 @@ pub(crate) mod local {
 
     use crate::{
         MicrosandboxError, MicrosandboxResult,
+        backend::LocalBackend,
         sandbox::fs::{FsEntry, FsEntryKind, FsMetadata},
     };
 
@@ -341,29 +344,42 @@ pub(crate) mod local {
     }
 
     /// Volume root directory on the host for the named volume.
-    fn volume_root(name: &str) -> PathBuf {
-        crate::backend::LocalBackend::ambient().volume_path(name)
+    fn volume_root(local: &LocalBackend, name: &str) -> PathBuf {
+        local.volume_path(name)
     }
 
     /// Resolve `(volume_name, path)` to a canonical host path.
-    fn resolve(name: &str, path: &str) -> MicrosandboxResult<PathBuf> {
-        resolve_relative(&volume_root(name), path)
+    fn resolve(local: &LocalBackend, name: &str, path: &str) -> MicrosandboxResult<PathBuf> {
+        resolve_relative(&volume_root(local, name), path)
     }
 
-    pub(crate) async fn read(name: &str, path: &str) -> MicrosandboxResult<Bytes> {
-        let full = resolve(name, path)?;
+    pub(crate) async fn read(
+        local: &LocalBackend,
+        name: &str,
+        path: &str,
+    ) -> MicrosandboxResult<Bytes> {
+        let full = resolve(local, name, path)?;
         let data = tokio::fs::read(&full).await?;
         Ok(Bytes::from(data))
     }
 
-    pub(crate) async fn read_to_string(name: &str, path: &str) -> MicrosandboxResult<String> {
-        let full = resolve(name, path)?;
+    pub(crate) async fn read_to_string(
+        local: &LocalBackend,
+        name: &str,
+        path: &str,
+    ) -> MicrosandboxResult<String> {
+        let full = resolve(local, name, path)?;
         let data = tokio::fs::read_to_string(&full).await?;
         Ok(data)
     }
 
-    pub(crate) async fn write(name: &str, path: &str, data: &[u8]) -> MicrosandboxResult<()> {
-        let full = resolve(name, path)?;
+    pub(crate) async fn write(
+        local: &LocalBackend,
+        name: &str,
+        path: &str,
+        data: &[u8],
+    ) -> MicrosandboxResult<()> {
+        let full = resolve(local, name, path)?;
         if let Some(parent) = full.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
@@ -371,8 +387,12 @@ pub(crate) mod local {
         Ok(())
     }
 
-    pub(crate) async fn list(name: &str, path: &str) -> MicrosandboxResult<Vec<FsEntry>> {
-        let root = volume_root(name);
+    pub(crate) async fn list(
+        local: &LocalBackend,
+        name: &str,
+        path: &str,
+    ) -> MicrosandboxResult<Vec<FsEntry>> {
+        let root = volume_root(local, name);
         let full = resolve_relative(&root, path)?;
         let mut dir = tokio::fs::read_dir(&full).await?;
         let mut entries = Vec::new();
@@ -403,27 +423,44 @@ pub(crate) mod local {
         Ok(entries)
     }
 
-    pub(crate) async fn mkdir(name: &str, path: &str) -> MicrosandboxResult<()> {
-        let full = resolve(name, path)?;
+    pub(crate) async fn mkdir(
+        local: &LocalBackend,
+        name: &str,
+        path: &str,
+    ) -> MicrosandboxResult<()> {
+        let full = resolve(local, name, path)?;
         tokio::fs::create_dir_all(&full).await?;
         Ok(())
     }
 
-    pub(crate) async fn remove_dir(name: &str, path: &str) -> MicrosandboxResult<()> {
-        let full = resolve(name, path)?;
+    pub(crate) async fn remove_dir(
+        local: &LocalBackend,
+        name: &str,
+        path: &str,
+    ) -> MicrosandboxResult<()> {
+        let full = resolve(local, name, path)?;
         tokio::fs::remove_dir_all(&full).await?;
         Ok(())
     }
 
-    pub(crate) async fn remove(name: &str, path: &str) -> MicrosandboxResult<()> {
-        let full = resolve(name, path)?;
+    pub(crate) async fn remove(
+        local: &LocalBackend,
+        name: &str,
+        path: &str,
+    ) -> MicrosandboxResult<()> {
+        let full = resolve(local, name, path)?;
         tokio::fs::remove_file(&full).await?;
         Ok(())
     }
 
-    pub(crate) async fn copy(name: &str, from: &str, to: &str) -> MicrosandboxResult<()> {
-        let src = resolve(name, from)?;
-        let dst = resolve(name, to)?;
+    pub(crate) async fn copy(
+        local: &LocalBackend,
+        name: &str,
+        from: &str,
+        to: &str,
+    ) -> MicrosandboxResult<()> {
+        let src = resolve(local, name, from)?;
+        let dst = resolve(local, name, to)?;
 
         if let Some(parent) = dst.parent() {
             tokio::fs::create_dir_all(parent).await?;
@@ -433,9 +470,14 @@ pub(crate) mod local {
         Ok(())
     }
 
-    pub(crate) async fn rename(name: &str, from: &str, to: &str) -> MicrosandboxResult<()> {
-        let src = resolve(name, from)?;
-        let dst = resolve(name, to)?;
+    pub(crate) async fn rename(
+        local: &LocalBackend,
+        name: &str,
+        from: &str,
+        to: &str,
+    ) -> MicrosandboxResult<()> {
+        let src = resolve(local, name, from)?;
+        let dst = resolve(local, name, to)?;
 
         if let Some(parent) = dst.parent() {
             tokio::fs::create_dir_all(parent).await?;
@@ -445,14 +487,22 @@ pub(crate) mod local {
         Ok(())
     }
 
-    pub(crate) async fn stat(name: &str, path: &str) -> MicrosandboxResult<FsMetadata> {
-        let full = resolve(name, path)?;
+    pub(crate) async fn stat(
+        local: &LocalBackend,
+        name: &str,
+        path: &str,
+    ) -> MicrosandboxResult<FsMetadata> {
+        let full = resolve(local, name, path)?;
         let meta = tokio::fs::symlink_metadata(&full).await?;
         Ok(std_metadata_to_fs(&meta))
     }
 
-    pub(crate) async fn exists(name: &str, path: &str) -> MicrosandboxResult<bool> {
-        let full = resolve(name, path)?;
+    pub(crate) async fn exists(
+        local: &LocalBackend,
+        name: &str,
+        path: &str,
+    ) -> MicrosandboxResult<bool> {
+        let full = resolve(local, name, path)?;
         Ok(tokio::fs::try_exists(&full).await.unwrap_or(false))
     }
 
