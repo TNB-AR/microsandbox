@@ -350,75 +350,36 @@ impl SandboxHandle {
 
     /// Stop the sandbox gracefully.
     ///
-    /// For local handles this sends SIGTERM to the libkrun process (no-op
-    /// when the sandbox isn't running). For cloud handles this issues
+    /// Routes through the backend trait. On local the trait impl connects
+    /// to the agent UDS and sends `core.shutdown` (clean ext4 unmount via
+    /// in-guest `sync()` + `reboot(RB_POWER_OFF)`), falling back to SIGTERM
+    /// via PID if the socket is unreachable. On cloud it issues
     /// `POST /v1/sandboxes/by-name/:name/stop`.
     pub async fn stop(&self) -> MicrosandboxResult<()> {
-        match &self.inner {
-            SandboxHandleInner::Local(local) => {
-                if local.status != SandboxStatus::Running && local.status != SandboxStatus::Draining
-                {
-                    return Ok(());
-                }
-                signal_pid(local.pid, nix::sys::signal::Signal::SIGTERM)?;
-                Ok(())
-            }
-            SandboxHandleInner::Cloud(_) => {
-                self.backend
-                    .sandboxes()
-                    .stop(self.backend.clone(), &self.name)
-                    .await
-            }
-        }
+        self.backend
+            .sandboxes()
+            .stop(self.backend.clone(), &self.name)
+            .await
     }
 
-    /// Kill the sandbox immediately.
+    /// Kill the sandbox immediately (SIGKILL).
     ///
-    /// Local handles signal SIGKILL to the libkrun PID and wait briefly,
-    /// then mark the sandbox stopped. Cloud handles currently return
-    /// `Unsupported`.
+    /// Routes through the backend trait. On local the trait impl signals
+    /// SIGKILL to the libkrun PID, waits briefly for exit, and marks the
+    /// DB row Stopped once dead. Updates the cached status snapshot on this
+    /// handle to match. Cloud handles currently return `Unsupported`.
     pub async fn kill(&mut self) -> MicrosandboxResult<()> {
-        match &mut self.inner {
-            SandboxHandleInner::Local(local) => {
-                if local.status != SandboxStatus::Running && local.status != SandboxStatus::Draining
-                {
-                    return Ok(());
-                }
-
-                let pids = signal_pid(local.pid, nix::sys::signal::Signal::SIGKILL)?;
-
-                if !pids.is_empty() {
-                    wait_for_exit(&pids, std::time::Duration::from_secs(5)).await;
-                }
-
-                // Mark stopped if all processes are confirmed dead (or were already gone).
-                let all_dead = pids.is_empty() || pids.iter().all(|pid| !super::pid_is_alive(*pid));
-
-                if all_dead {
-                    let local_backend = self.backend.as_local().ok_or_else(|| {
-                        crate::MicrosandboxError::Unsupported {
-                            feature: "SandboxHandle::kill on cloud".into(),
-                            available_when: "when cloud kill lands".into(),
-                        }
-                    })?;
-                    let db = local_backend.db().await?.write();
-                    if let Err(e) =
-                        super::update_sandbox_status(db, local.db_id, SandboxStatus::Stopped).await
-                    {
-                        tracing::warn!(sandbox = %self.name, error = %e, "failed to update sandbox status after kill");
-                    }
-                    local.status = SandboxStatus::Stopped;
-                }
-
-                Ok(())
-            }
-            SandboxHandleInner::Cloud(_) => {
-                self.backend
-                    .sandboxes()
-                    .kill(self.backend.clone(), &self.name)
-                    .await
-            }
+        self.backend
+            .sandboxes()
+            .kill(self.backend.clone(), &self.name)
+            .await?;
+        // Mirror the DB update onto the cached snapshot held by this handle.
+        if let SandboxHandleInner::Local(local) = &mut self.inner
+            && local.pid.is_none_or(|p| !super::pid_is_alive(p))
+        {
+            local.status = SandboxStatus::Stopped;
         }
+        Ok(())
     }
 
     /// Remove this sandbox.
@@ -473,34 +434,5 @@ impl std::fmt::Debug for SandboxHandle {
             .field("backend_kind", &self.backend.kind())
             .field("status", &self.status_snapshot())
             .finish()
-    }
-}
-
-//--------------------------------------------------------------------------------------------------
-// Functions
-//--------------------------------------------------------------------------------------------------
-
-/// Send a signal to the sandbox process.
-///
-/// Returns the PIDs that were signalled.
-fn signal_pid(pid: Option<i32>, signal: nix::sys::signal::Signal) -> MicrosandboxResult<Vec<i32>> {
-    if let Some(pid) = pid.filter(|pid| super::pid_is_alive(*pid)) {
-        nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), signal)?;
-        return Ok(vec![pid]);
-    }
-
-    Ok(vec![])
-}
-
-/// Poll until all PIDs have exited or the timeout is reached.
-async fn wait_for_exit(pids: &[i32], timeout: std::time::Duration) {
-    let start = std::time::Instant::now();
-    let poll_interval = std::time::Duration::from_millis(50);
-
-    while start.elapsed() < timeout {
-        if pids.iter().all(|pid| !super::pid_is_alive(*pid)) {
-            return;
-        }
-        tokio::time::sleep(poll_interval).await;
     }
 }

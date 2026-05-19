@@ -618,7 +618,15 @@ pub(crate) async fn remove_local(
     handle.remove().await
 }
 
-/// Local lifecycle: stop a sandbox by name (SIGTERM).
+/// Local lifecycle: stop a sandbox by name.
+///
+/// Prefers the agent UDS at `sandboxes_dir/<name>/runtime/agent.sock`:
+/// connects, sends `MessageType::Shutdown`, and lets agentd run an in-guest
+/// `sync()` + `reboot(RB_POWER_OFF)` so ext4 unmounts cleanly (no journal
+/// replay on next boot). Falls back to SIGTERM via PID if the socket is
+/// unreachable (agentd wedged, sandbox just transitioning, etc.).
+///
+/// No-op when the sandbox isn't in Running/Draining.
 pub(crate) async fn stop_local(
     backend: Arc<dyn crate::backend::Backend>,
     name: &str,
@@ -631,11 +639,52 @@ pub(crate) async fn stop_local(
                 available_when: "with a LocalBackend".into(),
             })?;
     let (model, pid) = get_local_handle_state(local_backend, name).await?;
-    let handle = SandboxHandle::from_local_model(backend, model, pid);
-    handle.stop().await
+    if model.status != SandboxStatus::Running && model.status != SandboxStatus::Draining {
+        return Ok(());
+    }
+
+    // Try the clean-shutdown path: connect to the agent relay UDS and send
+    // `core.shutdown`. agentd runs `sync()` + `reboot(RB_POWER_OFF)` so
+    // block-root filesystems unmount cleanly.
+    let sock_path = local_backend
+        .sandboxes_dir()
+        .join(name)
+        .join("runtime")
+        .join("agent.sock");
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    match AgentClient::connect(&sock_path, deadline).await {
+        Ok(client) => {
+            let msg = Message::new(MessageType::Shutdown, 0, Vec::new());
+            client.send(&msg).await?;
+            Ok(())
+        }
+        Err(e) => {
+            // Graceful degradation: agent UDS unreachable (socket missing,
+            // ECONNREFUSED, handshake timeout). Fall back to SIGTERM via PID
+            // so we still attempt a stop — at the cost of skipping the
+            // in-guest sync(). The reaper updates DB status on PID exit.
+            tracing::warn!(
+                sandbox = %name,
+                sock = %sock_path.display(),
+                error = %e,
+                "stop_local: agent UDS unreachable; falling back to SIGTERM",
+            );
+            if let Some(pid) = pid.filter(|p| pid_is_alive(*p)) {
+                nix::sys::signal::kill(
+                    nix::unistd::Pid::from_raw(pid),
+                    nix::sys::signal::Signal::SIGTERM,
+                )?;
+            }
+            Ok(())
+        }
+    }
 }
 
 /// Local lifecycle: kill a sandbox by name (SIGKILL).
+///
+/// Destructive by design — no clean-shutdown path. Signals SIGKILL to the
+/// libkrun PID, waits briefly for the process to exit, then marks the DB
+/// row Stopped if all signalled PIDs are confirmed dead.
 pub(crate) async fn kill_local(
     backend: Arc<dyn crate::backend::Backend>,
     name: &str,
@@ -648,12 +697,48 @@ pub(crate) async fn kill_local(
                 available_when: "with a LocalBackend".into(),
             })?;
     let (model, pid) = get_local_handle_state(local_backend, name).await?;
-    let mut handle = SandboxHandle::from_local_model(backend, model, pid);
-    handle.kill().await
+    if model.status != SandboxStatus::Running && model.status != SandboxStatus::Draining {
+        return Ok(());
+    }
+
+    let mut pids = Vec::new();
+    if let Some(pid) = pid.filter(|p| pid_is_alive(*p)) {
+        nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(pid),
+            nix::sys::signal::Signal::SIGKILL,
+        )?;
+        pids.push(pid);
+    }
+
+    if !pids.is_empty() {
+        let timeout = std::time::Duration::from_secs(5);
+        let start = std::time::Instant::now();
+        let poll_interval = std::time::Duration::from_millis(50);
+        while start.elapsed() < timeout {
+            if pids.iter().all(|pid| !pid_is_alive(*pid)) {
+                break;
+            }
+            tokio::time::sleep(poll_interval).await;
+        }
+    }
+
+    let all_dead = pids.is_empty() || pids.iter().all(|pid| !pid_is_alive(*pid));
+    if all_dead {
+        let db = local_backend.db().await?.write();
+        if let Err(e) = update_sandbox_status(db, model.id, SandboxStatus::Stopped).await {
+            tracing::warn!(sandbox = %name, error = %e, "failed to update sandbox status after kill");
+        }
+    }
+
+    Ok(())
 }
 
 /// Local lifecycle: drain a running sandbox by name (SIGUSR1 to the
 /// libkrun process).
+///
+/// The agent protocol has no `Drain` message type — drain is purely
+/// signal-based. The libkrun signal handler catches SIGUSR1, writes to the
+/// exit event fd, exit observers run, and the process terminates.
 pub(crate) async fn drain_local(
     backend: Arc<dyn crate::backend::Backend>,
     name: &str,
@@ -827,22 +912,17 @@ impl Sandbox {
 
     /// Stop the sandbox gracefully.
     ///
-    /// On the local backend this sends `core.shutdown` to agentd. On the
-    /// cloud backend it issues `POST /v1/sandboxes/by-name/:name/stop`.
+    /// Routes through the backend trait. On local this connects to the
+    /// agent UDS and sends `core.shutdown` (agentd runs `sync()` +
+    /// `reboot(RB_POWER_OFF)` for a clean ext4 unmount), falling back to
+    /// SIGTERM via PID if the socket is unreachable. On cloud this issues
+    /// `POST /v1/sandboxes/by-name/:name/stop`.
     pub async fn stop(&self) -> MicrosandboxResult<()> {
         tracing::debug!(sandbox = %self.name, "stop: dispatching");
-        match self.inner.as_ref() {
-            crate::backend::SandboxInner::Local(local) => {
-                let msg = Message::new(MessageType::Shutdown, 0, Vec::new());
-                local.client.send(&msg).await
-            }
-            crate::backend::SandboxInner::Cloud(_) => {
-                self.backend
-                    .sandboxes()
-                    .stop(self.backend.clone(), &self.name)
-                    .await
-            }
-        }
+        self.backend
+            .sandboxes()
+            .stop(self.backend.clone(), &self.name)
+            .await
     }
 
     /// Stop the sandbox gracefully and wait for the process to exit.
@@ -864,42 +944,24 @@ impl Sandbox {
 
     /// Kill the sandbox immediately (SIGKILL).
     ///
-    /// Routes through the backend trait. Cloud sandboxes currently return
-    /// `Unsupported`; local sandboxes signal the libkrun process.
+    /// Routes through the backend trait. On local the trait impl looks the
+    /// PID up from the DB and signals SIGKILL, then marks the row Stopped
+    /// once the process is confirmed dead. Cloud currently returns
+    /// `Unsupported`.
     pub async fn kill(&self) -> MicrosandboxResult<()> {
-        match self.inner.as_ref() {
-            crate::backend::SandboxInner::Local(local) => match &local.handle {
-                Some(h) => h.lock().await.kill(),
-                None => Err(crate::MicrosandboxError::Runtime(
-                    "cannot kill: not the lifecycle owner".into(),
-                )),
-            },
-            crate::backend::SandboxInner::Cloud(_) => {
-                self.backend
-                    .sandboxes()
-                    .kill(self.backend.clone(), &self.name)
-                    .await
-            }
-        }
+        self.backend
+            .sandboxes()
+            .kill(self.backend.clone(), &self.name)
+            .await
     }
 
-    /// Trigger a graceful drain (SIGUSR1). Cloud sandboxes currently return
-    /// `Unsupported`.
+    /// Trigger a graceful drain (SIGUSR1 to the libkrun PID on local).
+    /// Cloud sandboxes currently return `Unsupported`.
     pub async fn drain(&self) -> MicrosandboxResult<()> {
-        match self.inner.as_ref() {
-            crate::backend::SandboxInner::Local(local) => match &local.handle {
-                Some(h) => h.lock().await.drain(),
-                None => Err(crate::MicrosandboxError::Runtime(
-                    "cannot drain: not the lifecycle owner".into(),
-                )),
-            },
-            crate::backend::SandboxInner::Cloud(_) => {
-                self.backend
-                    .sandboxes()
-                    .drain(self.backend.clone(), &self.name)
-                    .await
-            }
-        }
+        self.backend
+            .sandboxes()
+            .drain(self.backend.clone(), &self.name)
+            .await
     }
 
     /// Wait for the sandbox process to exit. **Local backend only.**
