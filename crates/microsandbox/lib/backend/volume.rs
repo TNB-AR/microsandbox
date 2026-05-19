@@ -178,18 +178,16 @@ pub trait VolumeBackend: Send + Sync {
         path: &'a str,
     ) -> BoxFuture<'a, MicrosandboxResult<()>>;
 
-    /// Remove a single file.
+    /// Remove a file or directory.
+    ///
+    /// When `recursive` is `false` only single files are removed; pointing at
+    /// a directory yields an OS-level "is a directory" error. When `recursive`
+    /// is `true` the path is removed along with all of its contents.
     fn fs_remove<'a>(
         &'a self,
         name: &'a str,
         path: &'a str,
-    ) -> BoxFuture<'a, MicrosandboxResult<()>>;
-
-    /// Recursively remove a directory.
-    fn fs_remove_dir<'a>(
-        &'a self,
-        name: &'a str,
-        path: &'a str,
+        recursive: bool,
     ) -> BoxFuture<'a, MicrosandboxResult<()>>;
 
     /// Copy a file within the volume.
@@ -305,16 +303,9 @@ impl VolumeBackend for LocalBackend {
         &'a self,
         name: &'a str,
         path: &'a str,
+        recursive: bool,
     ) -> BoxFuture<'a, MicrosandboxResult<()>> {
-        Box::pin(async move { crate::volume::fs::local::remove(self, name, path).await })
-    }
-
-    fn fs_remove_dir<'a>(
-        &'a self,
-        name: &'a str,
-        path: &'a str,
-    ) -> BoxFuture<'a, MicrosandboxResult<()>> {
-        Box::pin(async move { crate::volume::fs::local::remove_dir(self, name, path).await })
+        Box::pin(async move { crate::volume::fs::local::remove(self, name, path, recursive).await })
     }
 
     fn fs_copy<'a>(
@@ -433,16 +424,9 @@ impl VolumeBackend for CloudBackend {
         &'a self,
         _name: &'a str,
         _path: &'a str,
+        _recursive: bool,
     ) -> BoxFuture<'a, MicrosandboxResult<()>> {
         Box::pin(async move { Err(unsupported("VolumeFs::remove")) })
-    }
-
-    fn fs_remove_dir<'a>(
-        &'a self,
-        _name: &'a str,
-        _path: &'a str,
-    ) -> BoxFuture<'a, MicrosandboxResult<()>> {
-        Box::pin(async move { Err(unsupported("VolumeFs::remove_dir")) })
     }
 
     fn fs_copy<'a>(

@@ -15,6 +15,8 @@
 //! the bulk of the old global config singleton plus the SQLite pool, so multiple
 //! backends can hold different configurations for tests / migrations.
 
+use std::collections::HashMap;
+use std::num::NonZero;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -24,11 +26,7 @@ use microsandbox_migration::{Migrator, MigratorTrait};
 use tokio::sync::OnceCell;
 
 use super::{Backend, BackendKind, SandboxBackend, VolumeBackend};
-use crate::config::{
-    DEFAULT_CONNECT_TIMEOUT_SECS, DEFAULT_MAX_CONNECTIONS, DatabaseConfig, LocalConfig,
-    PathsConfig, RegistriesConfig, SandboxDefaults, default_metrics_sample_interval,
-    load_persisted_config_or_default,
-};
+use crate::config::{DatabaseConfig, LocalConfig, RegistryEntry, load_persisted_config_or_default};
 use crate::{MicrosandboxError, MicrosandboxResult};
 
 //--------------------------------------------------------------------------------------------------
@@ -48,8 +46,14 @@ pub struct LocalBackend {
 
 /// Fluent builder for [`LocalBackend`]. Construct via [`LocalBackend::builder`].
 ///
-/// All fields are optional. `build().await` produces a `LocalBackend` whose
-/// DB pool has already been opened and migrated.
+/// All fields are optional. [`build`](Self::build)`.await` produces a
+/// `LocalBackend` whose DB pool has already been opened and migrated.
+///
+/// `build` overlays the builder's overrides on top of the persisted
+/// `~/.microsandbox/config.json` (honouring `MSB_CONFIG_PATH`). Persisted
+/// values fill in everything the builder didn't set; builder overrides win.
+/// Override the `home()` setter to point the merge at a different config
+/// file (the underlying loader still respects `MSB_CONFIG_PATH`).
 #[derive(Default)]
 pub struct LocalBackendBuilder {
     home: Option<PathBuf>,
@@ -64,6 +68,12 @@ pub struct LocalBackendBuilder {
     busy_timeout_secs: Option<u64>,
     default_cpus: Option<u8>,
     default_memory_mib: Option<u32>,
+    shell: Option<String>,
+    workdir: Option<String>,
+    metrics_sample_interval_ms: Option<Option<NonZero<u64>>>,
+    disable_metrics_sample: Option<bool>,
+    ca_certs: Option<Option<PathBuf>>,
+    registry_hosts: Option<HashMap<String, RegistryEntry>>,
     log_level: Option<microsandbox_runtime::logging::LogLevel>,
 }
 
@@ -234,6 +244,47 @@ impl LocalBackendBuilder {
         self
     }
 
+    /// Override the default shell used for interactive sessions and scripts.
+    pub fn shell(mut self, shell: impl Into<String>) -> Self {
+        self.shell = Some(shell.into());
+        self
+    }
+
+    /// Override the default working directory inside sandboxes.
+    pub fn workdir(mut self, workdir: impl Into<String>) -> Self {
+        self.workdir = Some(workdir.into());
+        self
+    }
+
+    /// Override the sandbox metrics sampling interval. Pass `0` to disable
+    /// sampling globally.
+    pub fn metrics_sample_interval_ms(mut self, ms: u64) -> Self {
+        self.metrics_sample_interval_ms = Some(NonZero::new(ms));
+        self
+    }
+
+    /// Force-disable sandbox metrics sampling regardless of the configured
+    /// interval.
+    pub fn disable_metrics_sample(mut self, disable: bool) -> Self {
+        self.disable_metrics_sample = Some(disable);
+        self
+    }
+
+    /// Override the path to additional CA root certificates trusted by
+    /// registry connections. Pass `None` to clear a persisted value.
+    pub fn ca_certs(mut self, path: Option<PathBuf>) -> Self {
+        self.ca_certs = Some(path);
+        self
+    }
+
+    /// Replace the per-registry hosts map. The provided map fully replaces
+    /// any persisted `registries.hosts` — additive merging isn't supported
+    /// by the builder (use a persisted config file for incremental edits).
+    pub fn registry_hosts(mut self, hosts: HashMap<String, RegistryEntry>) -> Self {
+        self.registry_hosts = Some(hosts);
+        self
+    }
+
     /// Override the runtime log level applied to SDK-spawned sandboxes.
     pub fn log_level(mut self, level: microsandbox_runtime::logging::LogLevel) -> Self {
         self.log_level = Some(level);
@@ -241,8 +292,14 @@ impl LocalBackendBuilder {
     }
 
     /// Build the `LocalBackend`. Opens the DB pool and applies migrations.
+    ///
+    /// Reads `~/.microsandbox/config.json` (or `MSB_CONFIG_PATH`) and
+    /// overlays the builder's overrides on top. Builder values win;
+    /// anything the builder didn't set falls through to the persisted
+    /// config (or the hard-coded defaults if no config file exists).
     pub async fn build(self) -> MicrosandboxResult<LocalBackend> {
-        let config = self.into_local_config();
+        let persisted = load_persisted_config_or_default().unwrap_or_default();
+        let config = self.merge_into(persisted);
         let backend = LocalBackend {
             config: Arc::new(config),
             db: OnceCell::new(),
@@ -251,7 +308,9 @@ impl LocalBackendBuilder {
         Ok(backend)
     }
 
-    fn into_local_config(self) -> LocalConfig {
+    /// Overlay the builder's overrides on top of `base`. Builder values win;
+    /// `None` builder fields fall through to `base`.
+    fn merge_into(self, mut base: LocalConfig) -> LocalConfig {
         let LocalBackendBuilder {
             home,
             sandboxes_dir,
@@ -265,39 +324,78 @@ impl LocalBackendBuilder {
             busy_timeout_secs,
             default_cpus,
             default_memory_mib,
+            shell,
+            workdir,
+            metrics_sample_interval_ms,
+            disable_metrics_sample,
+            ca_certs,
+            registry_hosts,
             log_level,
         } = self;
 
-        LocalConfig {
-            home,
-            log_level,
-            database: DatabaseConfig {
-                url: None,
-                max_connections: max_connections.unwrap_or(DEFAULT_MAX_CONNECTIONS),
-                connect_timeout_secs: connect_timeout_secs.unwrap_or(DEFAULT_CONNECT_TIMEOUT_SECS),
-                busy_timeout_secs: busy_timeout_secs
-                    .unwrap_or(microsandbox_db::pool::DEFAULT_BUSY_TIMEOUT_SECS),
-            },
-            paths: PathsConfig {
-                msb: None,
-                libkrunfw: None,
-                cache: cache_dir,
-                sandboxes: sandboxes_dir,
-                volumes: volumes_dir,
-                snapshots: snapshots_dir,
-                logs: logs_dir,
-                secrets: secrets_dir,
-            },
-            sandbox_defaults: SandboxDefaults {
-                cpus: default_cpus.unwrap_or(1),
-                memory_mib: default_memory_mib.unwrap_or(512),
-                shell: "/bin/sh".into(),
-                workdir: None,
-                metrics_sample_interval_ms: default_metrics_sample_interval(),
-                disable_metrics_sample: false,
-            },
-            registries: RegistriesConfig::default(),
+        if let Some(home) = home {
+            base.home = Some(home);
         }
+        if let Some(level) = log_level {
+            base.log_level = Some(level);
+        }
+
+        if let Some(v) = max_connections {
+            base.database.max_connections = v;
+        }
+        if let Some(v) = connect_timeout_secs {
+            base.database.connect_timeout_secs = v;
+        }
+        if let Some(v) = busy_timeout_secs {
+            base.database.busy_timeout_secs = v;
+        }
+
+        if let Some(p) = cache_dir {
+            base.paths.cache = Some(p);
+        }
+        if let Some(p) = sandboxes_dir {
+            base.paths.sandboxes = Some(p);
+        }
+        if let Some(p) = volumes_dir {
+            base.paths.volumes = Some(p);
+        }
+        if let Some(p) = snapshots_dir {
+            base.paths.snapshots = Some(p);
+        }
+        if let Some(p) = logs_dir {
+            base.paths.logs = Some(p);
+        }
+        if let Some(p) = secrets_dir {
+            base.paths.secrets = Some(p);
+        }
+
+        if let Some(v) = default_cpus {
+            base.sandbox_defaults.cpus = v;
+        }
+        if let Some(v) = default_memory_mib {
+            base.sandbox_defaults.memory_mib = v;
+        }
+        if let Some(v) = shell {
+            base.sandbox_defaults.shell = v;
+        }
+        if let Some(v) = workdir {
+            base.sandbox_defaults.workdir = Some(v);
+        }
+        if let Some(v) = metrics_sample_interval_ms {
+            base.sandbox_defaults.metrics_sample_interval_ms = v;
+        }
+        if let Some(v) = disable_metrics_sample {
+            base.sandbox_defaults.disable_metrics_sample = v;
+        }
+
+        if let Some(v) = ca_certs {
+            base.registries.ca_certs = v;
+        }
+        if let Some(v) = registry_hosts {
+            base.registries.hosts = v;
+        }
+
+        base
     }
 }
 
@@ -586,6 +684,59 @@ mod tests {
             !unexpected_path.exists(),
             "file must NOT appear under backend A's volumes_dir; \
              ambient() leak regressed"
+        );
+    }
+
+    /// `LocalBackendBuilder::build()` overlays builder overrides on top of
+    /// the persisted config — values the builder didn't set must be
+    /// preserved from the base. This test runs `merge_into` directly so it
+    /// doesn't have to mutate `MSB_CONFIG_PATH` (which races other tests).
+    #[test]
+    fn builder_merge_preserves_persisted_fields_when_not_overridden() {
+        // Persisted base: a fully-populated config the user supposedly
+        // wrote to ~/.microsandbox/config.json.
+        let base = LocalConfig {
+            log_level: Some(microsandbox_runtime::logging::LogLevel::Debug),
+            database: DatabaseConfig {
+                url: None,
+                max_connections: 9,
+                connect_timeout_secs: 17,
+                busy_timeout_secs: 23,
+            },
+            sandbox_defaults: crate::config::SandboxDefaults {
+                cpus: 4,
+                memory_mib: 2048,
+                shell: "/bin/zsh".into(),
+                workdir: Some("/work".into()),
+                metrics_sample_interval_ms: NonZero::new(750),
+                disable_metrics_sample: true,
+            },
+            ..Default::default()
+        };
+
+        // Builder overrides only one knob — vCPU count.
+        let merged = LocalBackend::builder().default_cpus(2).merge_into(base);
+
+        // The overridden field reflects the builder.
+        assert_eq!(merged.sandbox_defaults.cpus, 2);
+
+        // Everything else must survive from the persisted base.
+        assert_eq!(merged.sandbox_defaults.memory_mib, 2048);
+        assert_eq!(merged.sandbox_defaults.shell, "/bin/zsh");
+        assert_eq!(merged.sandbox_defaults.workdir, Some("/work".into()));
+        assert_eq!(
+            merged.sandbox_defaults.metrics_sample_interval_ms,
+            NonZero::new(750)
+        );
+        assert!(merged.sandbox_defaults.disable_metrics_sample);
+
+        assert_eq!(merged.database.max_connections, 9);
+        assert_eq!(merged.database.connect_timeout_secs, 17);
+        assert_eq!(merged.database.busy_timeout_secs, 23);
+
+        assert_eq!(
+            merged.log_level,
+            Some(microsandbox_runtime::logging::LogLevel::Debug)
         );
     }
 }

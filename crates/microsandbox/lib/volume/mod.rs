@@ -200,11 +200,13 @@ impl Volume {
 
 impl VolumeHandle {
     /// Build a handle from a local volume DB row.
-    pub(crate) fn from_local_model(
-        local_backend: &crate::backend::LocalBackend,
-        backend: Arc<dyn Backend>,
-        model: volume_entity::Model,
-    ) -> Self {
+    ///
+    /// Derives the host-side path from the `backend`'s [`LocalBackend`]
+    /// view — callers don't have to thread the same backend in twice.
+    /// Panics if `backend` is not a [`LocalBackend`]; this is the local
+    /// construction path and is only called from `get_local` / `list_local`,
+    /// which have already routed through the local trait impl.
+    pub(crate) fn from_local_model(backend: Arc<dyn Backend>, model: volume_entity::Model) -> Self {
         let labels = model
             .labels
             .as_deref()
@@ -216,6 +218,9 @@ impl VolumeHandle {
             })
             .unwrap_or_default();
 
+        let local_backend = backend
+            .as_local()
+            .expect("from_local_model called outside a LocalBackend context");
         let path = local_backend.volume_path(&model.name);
         let name = model.name;
         Self {
@@ -472,7 +477,7 @@ pub(crate) async fn get_local(
         .await?
         .ok_or_else(|| MicrosandboxError::VolumeNotFound(name.into()))?;
 
-    let handle = VolumeHandle::from_local_model(local_backend, backend.clone(), model);
+    let handle = VolumeHandle::from_local_model(backend, model);
     Ok(handle)
 }
 
@@ -493,7 +498,7 @@ pub(crate) async fn list_local(backend: Arc<dyn Backend>) -> MicrosandboxResult<
 
     Ok(models
         .into_iter()
-        .map(|m| VolumeHandle::from_local_model(local_backend, backend.clone(), m))
+        .map(|m| VolumeHandle::from_local_model(backend.clone(), m))
         .collect())
 }
 

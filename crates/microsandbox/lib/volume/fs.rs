@@ -163,12 +163,18 @@ impl<'a> VolumeFs<'a> {
 
     /// Remove a directory recursively.
     pub async fn remove_dir(&self, path: &str) -> MicrosandboxResult<()> {
-        self.backend.volumes().fs_remove_dir(self.name, path).await
+        self.backend
+            .volumes()
+            .fs_remove(self.name, path, true)
+            .await
     }
 
     /// Delete a single file. Use [`remove_dir`](Self::remove_dir) for directories.
     pub async fn remove(&self, path: &str) -> MicrosandboxResult<()> {
-        self.backend.volumes().fs_remove(self.name, path).await
+        self.backend
+            .volumes()
+            .fs_remove(self.name, path, false)
+            .await
     }
 
     /// Copy a file within the volume.
@@ -213,7 +219,7 @@ impl VolumeFs<'_> {
             .as_local()
             .ok_or_else(|| MicrosandboxError::Unsupported {
                 feature: feature.into(),
-                available_when: "when cloud streaming routes ship".into(),
+                available_when: "when cloud volumes ship".into(),
             })?;
         let root = local.volume_path(self.name);
         local::resolve_relative(&root, path)
@@ -433,23 +439,18 @@ pub(crate) mod local {
         Ok(())
     }
 
-    pub(crate) async fn remove_dir(
-        local: &LocalBackend,
-        name: &str,
-        path: &str,
-    ) -> MicrosandboxResult<()> {
-        let full = resolve(local, name, path)?;
-        tokio::fs::remove_dir_all(&full).await?;
-        Ok(())
-    }
-
     pub(crate) async fn remove(
         local: &LocalBackend,
         name: &str,
         path: &str,
+        recursive: bool,
     ) -> MicrosandboxResult<()> {
         let full = resolve(local, name, path)?;
-        tokio::fs::remove_file(&full).await?;
+        if recursive {
+            tokio::fs::remove_dir_all(&full).await?;
+        } else {
+            tokio::fs::remove_file(&full).await?;
+        }
         Ok(())
     }
 
