@@ -824,11 +824,6 @@ fn sandbox_cli_args(
         args.push(OsString::from(sandbox_id.to_string()));
     }
 
-    for (key, value) in &config.env {
-        args.push(OsString::from("--env"));
-        args.push(OsString::from(format!("{key}={value}")));
-    }
-
     if let Some(ref user) = config.user {
         args.push(OsString::from("--env"));
         args.push(OsString::from(format!("{}={user}", ENV_USER)));
@@ -1021,6 +1016,25 @@ mod tests {
             pair[0] == "--env"
                 && pair[1] == format!("{}=nofile=65535:65535", microsandbox_protocol::ENV_RLIMITS)
         }));
+    }
+
+    #[tokio::test]
+    async fn test_sandbox_cli_args_do_not_forward_sandbox_env() {
+        let config = SandboxBuilder::new("test")
+            .image("/tmp/rootfs")
+            .env("LONG_ENV", "x".repeat(8 * 1024))
+            .build()
+            .await
+            .unwrap();
+
+        let rendered = render_args(&config);
+
+        assert!(
+            !rendered
+                .windows(2)
+                .any(|pair| pair[0] == "--env" && pair[1].starts_with("LONG_ENV=")),
+            "sandbox env should be delivered through exec requests, not the VM kernel cmdline"
+        );
     }
 
     #[tokio::test]
