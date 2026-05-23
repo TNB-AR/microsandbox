@@ -121,8 +121,10 @@ impl MigrationTrait for Migration {
             .await?;
 
         // Partial unique index for sandbox-independent snapshots.
-        // SQLite treats NULLs as distinct in unique indexes, so the composite
-        // index above won't prevent duplicate names when sandbox_id IS NULL.
+        // Unique indexes treat NULLs as distinct (on both SQLite and
+        // PostgreSQL), so the composite index above won't prevent duplicate
+        // names when sandbox_id IS NULL. Partial indexes with a WHERE clause
+        // are supported by both backends with identical syntax.
         manager
             .get_connection()
             .execute_unprepared(

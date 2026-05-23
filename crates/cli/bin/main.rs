@@ -29,6 +29,22 @@ struct Cli {
     #[arg(long, global = true)]
     tree: bool,
 
+    /// Database connection URL (`sqlite://...` or `postgres://...`).
+    ///
+    /// Overrides the `MSB_DATABASE_URL` environment variable and the
+    /// `database.url` field in `~/.microsandbox/config.json`.
+    #[arg(long = "database", global = true, value_name = "URL")]
+    database: Option<String>,
+
+    /// PostgreSQL schema (`search_path`) for this node.
+    ///
+    /// Overrides `MSB_DATABASE_SCHEMA` and `database.schema` in the
+    /// config, and overrides any `search_path` embedded in the database
+    /// URL's `options` parameter. microsandbox creates the schema if it
+    /// does not already exist. Ignored on SQLite.
+    #[arg(long = "db-schema", global = true, value_name = "NAME")]
+    db_schema: Option<String>,
+
     #[command(flatten)]
     logs: LogArgs,
 
@@ -142,6 +158,15 @@ fn main() {
 
     let cli = Cli::parse();
     let log_level = cli.logs.selected_level();
+
+    // Apply the `--database` and `--db-schema` overrides before any code
+    // reads the global config or opens the database pools.
+    if let Some(url) = &cli.database {
+        microsandbox::config::set_database_url(url);
+    }
+    if let Some(schema) = &cli.db_schema {
+        microsandbox::config::set_database_schema(schema);
+    }
 
     let exit_code = match cli.command {
         // Sandbox process entry — never returns (VMM takes over).

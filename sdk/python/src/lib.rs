@@ -25,6 +25,8 @@ fn _microsandbox(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(setup::is_installed, m)?)?;
     m.add_function(wrap_pyfunction!(set_runtime_msb_path, m)?)?;
     m.add_function(wrap_pyfunction!(resolved_msb_path, m)?)?;
+    m.add_function(wrap_pyfunction!(set_database_url, m)?)?;
+    m.add_function(wrap_pyfunction!(set_database_schema, m)?)?;
     m.add_function(wrap_pyfunction!(metrics::all_sandbox_metrics, m)?)?;
     m.add_class::<sandbox::PySandbox>()?;
     m.add_class::<sandbox_handle::PySandboxHandle>()?;
@@ -71,4 +73,20 @@ fn resolved_msb_path() -> PyResult<String> {
     microsandbox::config::resolve_msb_path()
         .map(|path| path.to_string_lossy().into_owned())
         .map_err(error::to_py_err)
+}
+
+/// Set the database connection URL (e.g. `postgres://...` or
+/// `sqlite://...`). Call before any sandbox or database operation.
+/// Set-once: subsequent calls are ignored.
+#[pyfunction]
+fn set_database_url(url: String) {
+    microsandbox::config::set_database_url(url);
+}
+
+/// Set the PostgreSQL schema (`search_path`) for this process. Call before
+/// any sandbox or database operation. Set-once: subsequent calls are
+/// ignored. Ignored on SQLite.
+#[pyfunction]
+fn set_database_schema(name: String) {
+    microsandbox::config::set_database_schema(name);
 }

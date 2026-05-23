@@ -25,6 +25,8 @@ from microsandbox._microsandbox import (
     all_sandbox_metrics,
     install,
     is_installed,
+    set_database_schema,
+    set_database_url,
     version,
 )
 from microsandbox._microsandbox import (
@@ -247,4 +249,7 @@ __all__ = [
     "install",
     "is_installed",
     "version",
+    # Database configuration
+    "set_database_url",
+    "set_database_schema",
 ]

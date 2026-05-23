@@ -62,6 +62,12 @@ pub(crate) mod metrics_interval_serde {
 ))]
 const REGISTRY_KEYRING_SERVICE: &str = "dev.microsandbox.registry";
 
+/// Environment variable that overrides the configured database URL.
+pub const DATABASE_URL_ENV: &str = "MSB_DATABASE_URL";
+
+/// Environment variable that overrides the configured database schema.
+pub const DATABASE_SCHEMA_ENV: &str = "MSB_DATABASE_SCHEMA";
+
 //--------------------------------------------------------------------------------------------------
 // Types
 //--------------------------------------------------------------------------------------------------
@@ -123,7 +129,20 @@ pub struct MetricsConfig {
 #[serde(default)]
 pub struct DatabaseConfig {
     /// Database connection URL. `None` uses the default SQLite path.
+    ///
+    /// The scheme selects the backend: `sqlite://` or `postgres://`.
     pub url: Option<String>,
+
+    /// PostgreSQL schema to pin `search_path` to.
+    ///
+    /// When `Some` on a PostgreSQL backend, microsandbox creates the
+    /// schema if missing (`CREATE SCHEMA IF NOT EXISTS`) and applies
+    /// `search_path` on every connection — overriding any `search_path`
+    /// embedded in the URL's `options` parameter. Ignored on SQLite
+    /// (SQLite has no schema namespaces), so a global config carrying
+    /// this field is harmless on either backend. Validated against the
+    /// PostgreSQL identifier rules at resolve time.
+    pub schema: Option<String>,
 
     /// Maximum connection pool size.
     pub max_connections: u32,
@@ -132,7 +151,8 @@ pub struct DatabaseConfig {
     pub connect_timeout_secs: u64,
 
     /// SQLite `busy_timeout` PRAGMA: seconds SQLite waits on a contended
-    /// lock before surfacing `SQLITE_BUSY` to the retry layer.
+    /// lock before surfacing `SQLITE_BUSY` to the retry layer. Ignored on
+    /// PostgreSQL.
     pub busy_timeout_secs: u64,
 }
 
@@ -274,6 +294,8 @@ struct KeyringRegistryCredential {
 
 static CONFIG: OnceLock<GlobalConfig> = OnceLock::new();
 static SDK_MSB_PATH: OnceLock<PathBuf> = OnceLock::new();
+static DATABASE_URL_OVERRIDE: OnceLock<String> = OnceLock::new();
+static DATABASE_SCHEMA_OVERRIDE: OnceLock<String> = OnceLock::new();
 
 impl GlobalConfig {
     /// Get the resolved home directory.
@@ -509,6 +531,7 @@ impl Default for DatabaseConfig {
     fn default() -> Self {
         Self {
             url: None,
+            schema: None,
             max_connections: DEFAULT_MAX_CONNECTIONS,
             connect_timeout_secs: DEFAULT_CONNECT_TIMEOUT_SECS,
             busy_timeout_secs: microsandbox_db::pool::DEFAULT_BUSY_TIMEOUT_SECS,
@@ -674,6 +697,114 @@ pub fn set_config(config: GlobalConfig) -> Result<(), GlobalConfig> {
 /// still wins over this value. Set-once: subsequent calls are ignored.
 pub fn set_sdk_msb_path(path: impl Into<PathBuf>) {
     let _ = SDK_MSB_PATH.set(path.into());
+}
+
+/// Set the database connection URL programmatically (e.g. from a
+/// `--database` CLI flag, or from an SDK before any sandbox/DB operation).
+///
+/// Must be called before the global pool is first opened. Set-once:
+/// subsequent calls are ignored. Takes precedence over the
+/// `MSB_DATABASE_URL` env var and the config file.
+pub fn set_database_url(url: impl Into<String>) {
+    let _ = DATABASE_URL_OVERRIDE.set(url.into());
+}
+
+/// Set the PostgreSQL schema programmatically (e.g. from a `--db-schema`
+/// CLI flag, or from an SDK before any sandbox/DB operation).
+///
+/// Must be called before the global pool is first opened. Set-once:
+/// subsequent calls are ignored. Takes precedence over the
+/// `MSB_DATABASE_SCHEMA` env var and the config file. The schema name is
+/// validated at resolve time (so invalid names surface as a clear error
+/// on first DB access rather than here, where the SDK boundary often has
+/// no error channel).
+///
+/// On SQLite the schema is silently ignored (with a debug log) — so a
+/// global config carrying a schema is harmless on SQLite hosts.
+pub fn set_database_schema(name: impl Into<String>) {
+    let _ = DATABASE_SCHEMA_OVERRIDE.set(name.into());
+}
+
+/// The database connection URL resolved for this process.
+///
+/// Precedence (highest first):
+/// 1. the `--database` override set via [`set_database_url`]
+/// 2. the `MSB_DATABASE_URL` environment variable
+/// 3. `database.url` in `~/.microsandbox/config.json`
+/// 4. the default SQLite file at `{home}/db/msb.db`
+pub fn database_url() -> String {
+    let cfg = config();
+    resolve_database_url(
+        DATABASE_URL_OVERRIDE.get().map(String::as_str),
+        std::env::var(DATABASE_URL_ENV).ok().as_deref(),
+        cfg.database.url.as_deref(),
+        &cfg.home(),
+    )
+}
+
+/// The PostgreSQL schema resolved for this process, if any.
+///
+/// Precedence (highest first):
+/// 1. the `--db-schema` override set via [`set_database_schema`]
+/// 2. the `MSB_DATABASE_SCHEMA` environment variable
+/// 3. `database.schema` in `~/.microsandbox/config.json`
+/// 4. unset — microsandbox leaves `search_path` to the URL/role default
+pub fn database_schema() -> Option<String> {
+    let cfg = config();
+    resolve_database_schema(
+        DATABASE_SCHEMA_OVERRIDE.get().map(String::as_str),
+        std::env::var(DATABASE_SCHEMA_ENV).ok().as_deref(),
+        cfg.database.schema.as_deref(),
+    )
+}
+
+/// Pure precedence ladder for [`database_url`]. Side-effect free so it can
+/// be unit-tested with injected inputs.
+fn resolve_database_url(
+    override_url: Option<&str>,
+    env_url: Option<&str>,
+    config_url: Option<&str>,
+    home: &Path,
+) -> String {
+    let non_empty = |url: &str| !url.trim().is_empty();
+
+    if let Some(url) = override_url.filter(|u| non_empty(u)) {
+        return url.to_string();
+    }
+    if let Some(url) = env_url.filter(|u| non_empty(u)) {
+        return url.to_string();
+    }
+    if let Some(url) = config_url.filter(|u| non_empty(u)) {
+        return url.to_string();
+    }
+    default_sqlite_url(home)
+}
+
+/// Pure precedence ladder for [`database_schema`]. Same shape as
+/// [`resolve_database_url`]; falls back to `None`.
+fn resolve_database_schema(
+    override_schema: Option<&str>,
+    env_schema: Option<&str>,
+    config_schema: Option<&str>,
+) -> Option<String> {
+    let non_empty = |s: &str| !s.trim().is_empty();
+
+    override_schema
+        .or(env_schema)
+        .or(config_schema)
+        .filter(|s| non_empty(s))
+        .map(|s| s.to_string())
+}
+
+/// The default SQLite connection URL: `sqlite://{home}/db/msb.db`.
+///
+/// Exposed crate-local so the `db` module's tests can build matching
+/// settings without re-implementing the path.
+pub(crate) fn default_sqlite_url(home: &Path) -> String {
+    let path = home
+        .join(microsandbox_utils::DB_SUBDIR)
+        .join(microsandbox_utils::DB_FILENAME);
+    format!("sqlite://{}", path.display())
 }
 
 /// Resolve the path to the `msb` binary.
@@ -1682,5 +1813,76 @@ mod tests {
     fn resolve_msb_path_errors_when_all_tiers_empty() {
         let result = resolve_msb_path_from(None, None, None, &none, &none, &none);
         assert!(matches!(result, Err(MicrosandboxError::Custom(_))));
+    }
+
+    //----------------------------------------------------------------------------------------------
+    // resolve_database_url precedence
+    //----------------------------------------------------------------------------------------------
+
+    #[test]
+    fn resolve_database_url_override_wins() {
+        let url = resolve_database_url(
+            Some("postgres://override/msb"),
+            Some("postgres://env/msb"),
+            Some("postgres://config/msb"),
+            Path::new("/home"),
+        );
+        assert_eq!(url, "postgres://override/msb");
+    }
+
+    #[test]
+    fn resolve_database_url_env_wins_over_config() {
+        let url = resolve_database_url(
+            None,
+            Some("postgres://env/msb"),
+            Some("postgres://config/msb"),
+            Path::new("/home"),
+        );
+        assert_eq!(url, "postgres://env/msb");
+    }
+
+    #[test]
+    fn resolve_database_url_config_wins_over_default() {
+        let url = resolve_database_url(
+            None,
+            None,
+            Some("postgres://config/msb"),
+            Path::new("/home"),
+        );
+        assert_eq!(url, "postgres://config/msb");
+    }
+
+    #[test]
+    fn resolve_database_url_falls_back_to_default_sqlite() {
+        let url = resolve_database_url(None, Some(""), Some("  "), Path::new("/home"));
+        assert_eq!(url, "sqlite:///home/db/msb.db");
+    }
+
+    //----------------------------------------------------------------------------------------------
+    // resolve_database_schema precedence
+    //----------------------------------------------------------------------------------------------
+
+    #[test]
+    fn resolve_database_schema_override_wins() {
+        let s = resolve_database_schema(Some("override"), Some("env"), Some("config"));
+        assert_eq!(s.as_deref(), Some("override"));
+    }
+
+    #[test]
+    fn resolve_database_schema_env_wins_over_config() {
+        let s = resolve_database_schema(None, Some("env"), Some("config"));
+        assert_eq!(s.as_deref(), Some("env"));
+    }
+
+    #[test]
+    fn resolve_database_schema_config_used_when_no_higher() {
+        let s = resolve_database_schema(None, None, Some("config"));
+        assert_eq!(s.as_deref(), Some("config"));
+    }
+
+    #[test]
+    fn resolve_database_schema_unset_means_none() {
+        assert!(resolve_database_schema(None, None, None).is_none());
+        assert!(resolve_database_schema(None, Some(""), Some("  ")).is_none());
     }
 }

@@ -35,6 +35,30 @@ void msb_free_string(char *ptr);
 void msb_set_sdk_msb_path(const char *path);
 
 /**
+ * Set the database connection URL (e.g. `postgres://...` or
+ * `sqlite://...`). Must be called before any sandbox/DB operation.
+ * Set-once: subsequent calls are ignored. Null or invalid-UTF-8 inputs
+ * are silently ignored.
+ *
+ * # Safety
+ * `url` must be either null or a valid null-terminated UTF-8 C string
+ * owned by the caller for the duration of this call.
+ */
+void msb_set_database_url(const char *url);
+
+/**
+ * Set the PostgreSQL schema (`search_path`) for this process. Must be
+ * called before any sandbox/DB operation. Set-once: subsequent calls are
+ * ignored. Null or invalid-UTF-8 inputs are silently ignored. Ignored
+ * on SQLite.
+ *
+ * # Safety
+ * `name` must be either null or a valid null-terminated UTF-8 C string
+ * owned by the caller for the duration of this call.
+ */
+void msb_set_database_schema(const char *name);
+
+/**
  * Allocate and register a new CancellationToken. Returns the opaque id that
  * must be passed to the corresponding blocking msb_* call and later freed
  * with msb_cancel_unregister.

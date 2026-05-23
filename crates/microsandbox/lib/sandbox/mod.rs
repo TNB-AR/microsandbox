@@ -2099,14 +2099,14 @@ mod tests {
         // Connect timeout matches the production default (30s). 1s was too
         // tight on cold ci runners and surfaced as `PoolTimedOut` flakes
         // before the test body had a chance to run.
-        let pools = DbPools::open(
-            db_path,
-            1,
-            std::time::Duration::from_secs(30),
-            std::time::Duration::from_secs(5),
-        )
-        .await
-        .unwrap();
+        let settings = microsandbox_db::DbSettings {
+            url: format!("sqlite://{}", db_path.display()),
+            schema: None,
+            max_connections: 1,
+            connect_timeout: std::time::Duration::from_secs(30),
+            busy_timeout: std::time::Duration::from_secs(5),
+        };
+        let pools = DbPools::open(&settings).await.unwrap();
         Migrator::up(pools.write().inner(), None).await.unwrap();
         pools
     }

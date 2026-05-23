@@ -12,7 +12,7 @@ mod error;
 pub mod agent;
 pub mod config;
 #[allow(dead_code)]
-pub(crate) mod db;
+pub mod db;
 pub mod image;
 pub mod logs;
 pub mod runtime;

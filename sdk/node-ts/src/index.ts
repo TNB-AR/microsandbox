@@ -336,6 +336,7 @@ export type PullProgressStream = NapiPullProgressStream;
 
 // Setup + module-level helpers
 export { Setup, install, isInstalled, setup } from "./setup.js";
+export { setDatabaseSchema, setDatabaseUrl } from "./database.js";
 export { allSandboxMetrics } from "./all-metrics.js";
 
 // Errors

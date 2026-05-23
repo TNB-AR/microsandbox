@@ -58,8 +58,12 @@ pub struct Config {
     /// Selected tracing verbosity.
     pub log_level: Option<LogLevel>,
 
-    /// Path to the sandbox database file.
-    pub sandbox_db_path: PathBuf,
+    /// Database connection URL (`sqlite://...` or `postgres://...`).
+    pub sandbox_db_url: String,
+
+    /// PostgreSQL schema (`search_path`) for the supervisor's DB writes.
+    /// Ignored on SQLite.
+    pub sandbox_db_schema: Option<String>,
 
     /// Timeout when acquiring a sandbox database connection from the pool.
     pub sandbox_db_connect_timeout_secs: u64,
@@ -339,7 +343,8 @@ fn run(config: Config) -> RuntimeResult<std::convert::Infallible> {
     let (mut relay, db, run_db_id) = tokio_rt.block_on(async {
         let relay = AgentRelay::new(&config.agent_sock_path, Arc::clone(&shared));
         let db = connect_db(
-            &config.sandbox_db_path,
+            &config.sandbox_db_url,
+            config.sandbox_db_schema.clone(),
             config.sandbox_db_connect_timeout_secs,
         );
         let (relay, db) = tokio::try_join!(relay, db)?;
@@ -970,20 +975,31 @@ fn write_startup_info(json: &str) -> RuntimeResult<()> {
 
 /// Connect to the sandbox database.
 ///
+/// The backend (SQLite or PostgreSQL) is selected from `db_url`'s scheme.
+/// `db_schema`, when set, pins `search_path` on every connection so the
+/// supervisor's writes land in the same schema the host is using.
+///
 /// Busy timeout uses [`microsandbox_db::pool::DEFAULT_BUSY_TIMEOUT_SECS`]:
 /// the in-VM runtime is not user-configurable, so DB tuning policy lives
 /// with the host (which honours `~/.microsandbox/config.json`).
 async fn connect_db(
-    db_path: &std::path::Path,
+    db_url: &str,
+    db_schema: Option<String>,
     connect_timeout_secs: u64,
 ) -> RuntimeResult<DbWriteConnection> {
-    DbWriteConnection::open(
-        db_path,
-        Duration::from_secs(connect_timeout_secs),
-        Duration::from_secs(microsandbox_db::pool::DEFAULT_BUSY_TIMEOUT_SECS),
-    )
-    .await
-    .map_err(|e| RuntimeError::Custom(format!("database connect: {e}")))
+    let settings = microsandbox_db::DbSettings {
+        url: db_url.to_string(),
+        schema: db_schema,
+        // The supervisor only writes run records, so a small pool is
+        // ample. SQLite ignores this — its write pool is always a single
+        // connection — but PostgreSQL uses it to size the write pool.
+        max_connections: 2,
+        connect_timeout: Duration::from_secs(connect_timeout_secs),
+        busy_timeout: Duration::from_secs(microsandbox_db::pool::DEFAULT_BUSY_TIMEOUT_SECS),
+    };
+    DbWriteConnection::open(&settings)
+        .await
+        .map_err(|e| RuntimeError::Custom(format!("database connect: {e}")))
 }
 
 /// Insert a run record into the database.

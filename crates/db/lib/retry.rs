@@ -3,6 +3,11 @@
 //! Lives in this crate (rather than the host) because it pattern-matches
 //! on `sqlx::Error` directly — sqlx is already a dep here, and we don't
 //! want to re-add it to `microsandbox` just for an error sniff.
+//!
+//! On non-SQLite backends (PostgreSQL) this is a transparent no-op:
+//! [`is_sqlite_busy`] never matches a Postgres error code, so
+//! [`retry_on_busy`] returns the first result without retrying. Server
+//! backends handle concurrent writers natively and need no busy retry.
 
 use std::{future::Future, time::Duration};
 

@@ -15,5 +15,6 @@ path = "lib/lib.rs"
 async-trait = "0.1"
 sea-orm.workspace = true
 sqlx.workspace = true
+thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true

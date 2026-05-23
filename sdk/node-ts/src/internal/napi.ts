@@ -22,6 +22,8 @@ export const napi = native;
 
 export interface NativeBindings {
   readonly setRuntimeMsbPath?: (path: string) => void;
+  readonly setDatabaseUrl: (url: string) => void;
+  readonly setDatabaseSchema: (name: string) => void;
   readonly Sandbox: NapiSandboxStatic;
   readonly SandboxBuilder: NapiSandboxBuilderCtor;
   readonly Volume: NapiVolumeStatic;

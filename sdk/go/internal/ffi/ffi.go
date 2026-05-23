@@ -63,6 +63,8 @@ package ffi
 // ---------------------------------------------------------------------------
 typedef void     (*msb_free_string_fn)(char *ptr);
 typedef void     (*msb_set_sdk_msb_path_fn)(const char *path);
+typedef void     (*msb_set_database_url_fn)(const char *url);
+typedef void     (*msb_set_database_schema_fn)(const char *name);
 typedef uint64_t (*msb_cancel_alloc_fn)(void);
 typedef void     (*msb_cancel_trigger_fn)(uint64_t id);
 typedef void     (*msb_cancel_unregister_fn)(uint64_t id);
@@ -177,6 +179,8 @@ typedef void (*msb_agent_free_bytes_fn)(uint8_t *ptr, size_t len);
 // ---------------------------------------------------------------------------
 static msb_free_string_fn        ptr_msb_free_string        = NULL;
 static msb_set_sdk_msb_path_fn   ptr_msb_set_sdk_msb_path   = NULL;
+static msb_set_database_url_fn   ptr_msb_set_database_url   = NULL;
+static msb_set_database_schema_fn ptr_msb_set_database_schema = NULL;
 static msb_cancel_alloc_fn       ptr_msb_cancel_alloc       = NULL;
 static msb_cancel_trigger_fn     ptr_msb_cancel_trigger     = NULL;
 static msb_cancel_unregister_fn  ptr_msb_cancel_unregister  = NULL;
@@ -308,6 +312,8 @@ const char *load_microsandbox(const char *path) {
 	}
 	RESOLVE(msb_free_string);
 	RESOLVE(msb_set_sdk_msb_path);
+	RESOLVE(msb_set_database_url);
+	RESOLVE(msb_set_database_schema);
 	RESOLVE(msb_cancel_alloc);
 	RESOLVE(msb_cancel_trigger);
 	RESOLVE(msb_cancel_unregister);
@@ -422,6 +428,12 @@ void call_msb_free_string(char *ptr) {
 }
 void call_msb_set_sdk_msb_path(const char *path) {
 	if (ptr_msb_set_sdk_msb_path) ptr_msb_set_sdk_msb_path(path);
+}
+void call_msb_set_database_url(const char *url) {
+	if (ptr_msb_set_database_url) ptr_msb_set_database_url(url);
+}
+void call_msb_set_database_schema(const char *name) {
+	if (ptr_msb_set_database_schema) ptr_msb_set_database_schema(name);
 }
 uint64_t call_msb_cancel_alloc(void) {
 	return ptr_msb_cancel_alloc ? ptr_msb_cancel_alloc() : 0;
@@ -769,6 +781,33 @@ func SetSdkMsbPath(path string) {
 	cPath := C.CString(path)
 	defer C.free(unsafe.Pointer(cPath))
 	C.call_msb_set_sdk_msb_path(cPath)
+}
+
+// SetDatabaseURL sets the database connection URL for this process
+// (e.g. postgres://... or sqlite:///path). Set-once on the Rust side:
+// subsequent calls are ignored. Overrides the MSB_DATABASE_URL env var
+// and the database.url field in ~/.microsandbox/config.json.
+func SetDatabaseURL(url string) {
+	if url == "" {
+		return
+	}
+	cURL := C.CString(url)
+	defer C.free(unsafe.Pointer(cURL))
+	C.call_msb_set_database_url(cURL)
+}
+
+// SetDatabaseSchema sets the PostgreSQL schema (search_path) for this
+// process. Set-once on the Rust side: subsequent calls are ignored.
+// Overrides MSB_DATABASE_SCHEMA, database.schema in
+// ~/.microsandbox/config.json, and any search_path embedded in the URL.
+// Ignored on SQLite.
+func SetDatabaseSchema(name string) {
+	if name == "" {
+		return
+	}
+	cName := C.CString(name)
+	defer C.free(unsafe.Pointer(cName))
+	C.call_msb_set_database_schema(cName)
 }
 
 // autoLoader is set by the parent SDK package's init() to a function

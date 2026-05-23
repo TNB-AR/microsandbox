@@ -1,24 +1,25 @@
 //! Typed wrappers around `sea_orm::DatabaseConnection`.
 //!
 //! Splits a connection into [`DbReadConnection`] and [`DbWriteConnection`]
-//! so the type system enforces which pool a given operation hits. SQLite is
-//! single-writer system-wide; routing every write through a dedicated
-//! single-connection write pool turns intra-process contention into an
-//! in-process queue rather than `SQLITE_BUSY` retries.
+//! so the type system enforces which pool a given operation hits. For
+//! SQLite the write pool is a dedicated single connection (SQLite is
+//! single-writer system-wide), which turns intra-process contention into a
+//! deterministic queue rather than `SQLITE_BUSY` retries; for PostgreSQL
+//! both pools are ordinary multi-connection pools. See [`crate::pool`].
 //!
 //! Both types implement [`sea_orm::ConnectionTrait`], so existing query
 //! builders (`Entity::find().all(db)`, `Entity::insert(...).exec(db)`, etc.)
 //! work without source changes — callers just pick the right type for the
 //! operation.
 
-use std::{future::Future, path::Path, time::Duration};
+use std::future::Future;
 
 use sea_orm::{
     ConnectionTrait, DatabaseConnection, DatabaseTransaction, DbBackend, DbErr, ExecResult,
     QueryResult, Statement, TransactionTrait,
 };
 
-use crate::{pool, retry, retry::IsSqliteBusy};
+use crate::{backend::DbError, pool, pool::DbSettings, retry, retry::IsSqliteBusy};
 
 /// Read pool. Multi-connection; concurrent reads enabled by WAL mode.
 ///
@@ -50,16 +51,9 @@ impl DbReadConnection {
         Self(inner)
     }
 
-    /// Open a stand-alone read pool at `db_path` with shared PRAGMAs.
-    pub async fn open(
-        db_path: &Path,
-        max_connections: u32,
-        connect_timeout: Duration,
-        busy_timeout: Duration,
-    ) -> Result<Self, sqlx::Error> {
-        let conn =
-            pool::build_pool(db_path, max_connections, connect_timeout, busy_timeout).await?;
-        Ok(Self(conn))
+    /// Open a stand-alone read pool for the database in `settings`.
+    pub async fn open(settings: &DbSettings) -> Result<Self, DbError> {
+        Ok(Self(pool::build_read_pool(settings).await?))
     }
 
     /// Borrow the underlying sea-orm connection.
@@ -74,17 +68,13 @@ impl DbWriteConnection {
         Self(inner)
     }
 
-    /// Open a stand-alone single-connection write pool at `db_path`.
+    /// Open a stand-alone write pool for the database in `settings`.
     ///
     /// Used by callers that don't need a paired read pool (e.g. the in-VM
-    /// runtime, which only writes run records).
-    pub async fn open(
-        db_path: &Path,
-        connect_timeout: Duration,
-        busy_timeout: Duration,
-    ) -> Result<Self, sqlx::Error> {
-        let conn = pool::build_pool(db_path, 1, connect_timeout, busy_timeout).await?;
-        Ok(Self(conn))
+    /// runtime, which only writes run records). The pool is a single
+    /// connection for SQLite and a multi-connection pool for PostgreSQL.
+    pub async fn open(settings: &DbSettings) -> Result<Self, DbError> {
+        Ok(Self(pool::build_write_pool(settings).await?))
     }
 
     /// Borrow the underlying sea-orm connection.

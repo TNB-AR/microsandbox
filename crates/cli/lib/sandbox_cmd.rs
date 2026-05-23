@@ -27,9 +27,23 @@ pub struct SandboxArgs {
     #[arg(long = "sandbox-id")]
     pub sandbox_id: i32,
 
-    /// Path to the sandbox database file.
-    #[arg(long = "db-path")]
-    pub sandbox_db_path: PathBuf,
+    /// Database connection URL (`sqlite://...` or `postgres://...`).
+    ///
+    /// Read from the `MSB_DATABASE_URL` environment variable set by the
+    /// host process, so a `postgres://` URL containing credentials never
+    /// appears in this process's command line.
+    #[arg(long = "db-url", env = "MSB_DATABASE_URL")]
+    pub sandbox_db_url: String,
+
+    /// PostgreSQL schema (`search_path`) to use for this sandbox's DB
+    /// writes. Read from the `MSB_DATABASE_SCHEMA` environment variable
+    /// set by the host. Ignored on SQLite.
+    ///
+    /// The long name is `--sandbox-db-schema` (not `--db-schema`) so it
+    /// doesn't collide with the host's global `--db-schema` flag, which
+    /// is also visible on this subcommand because of `global = true`.
+    #[arg(long = "sandbox-db-schema", env = "MSB_DATABASE_SCHEMA")]
+    pub sandbox_db_schema: Option<String>,
 
     /// Timeout when acquiring a sandbox database connection from the pool.
     #[arg(long = "db-connect-timeout-secs", default_value_t = 30)]
@@ -202,7 +216,8 @@ pub fn run(args: SandboxArgs, log_level: Option<LogLevel>) -> ! {
         sandbox_name: args.sandbox_name,
         sandbox_id: args.sandbox_id,
         log_level,
-        sandbox_db_path: args.sandbox_db_path,
+        sandbox_db_url: args.sandbox_db_url,
+        sandbox_db_schema: args.sandbox_db_schema,
         sandbox_db_connect_timeout_secs: args.sandbox_db_connect_timeout_secs,
         log_dir: args.log_dir,
         runtime_dir: args.runtime_dir,

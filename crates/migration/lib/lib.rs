@@ -1,4 +1,10 @@
 //! Database migrations for microsandbox.
+//!
+//! Migrations run against whichever backend the connection targets
+//! (SQLite or PostgreSQL). The sea-orm schema DSL emits dialect-correct
+//! DDL, so migrations are backend-agnostic by default. When a migration
+//! genuinely needs different DDL per backend, branch on
+//! `manager.get_database_backend()` inside `up()`/`down()`.
 
 mod m20260305_000001_create_image_tables;
 mod m20260305_000002_create_sandbox_tables;

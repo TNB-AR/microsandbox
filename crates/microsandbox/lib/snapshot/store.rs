@@ -6,7 +6,7 @@ use chrono::Utc;
 use microsandbox_image::snapshot::{MANIFEST_FILENAME, Manifest};
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter,
-    QueryOrder,
+    QueryOrder, sea_query::Expr,
 };
 
 use crate::db::entity::snapshot as snapshot_entity;
@@ -154,12 +154,14 @@ pub(super) async fn index_upsert(
 
     // If this snapshot has a parent, bump the parent's child_count.
     if let Some(parent) = manifest.parent.as_ref() {
-        use sea_orm::ConnectionTrait;
-        db.execute_unprepared(&format!(
-            "UPDATE snapshot_index SET child_count = child_count + 1 WHERE digest = '{}'",
-            parent.replace('\'', "''")
-        ))
-        .await?;
+        snapshot_entity::Entity::update_many()
+            .col_expr(
+                snapshot_entity::Column::ChildCount,
+                Expr::col(snapshot_entity::Column::ChildCount).add(1),
+            )
+            .filter(snapshot_entity::Column::Digest.eq(parent.clone()))
+            .exec(db)
+            .await?;
     }
 
     Ok(())
@@ -258,11 +260,16 @@ pub(super) async fn remove_snapshot(path_or_name: &str, force: bool) -> Microsan
         .exec(write_db)
         .await?;
     if let Some(p) = parent {
-        write_db
-            .execute_unprepared(&format!(
-                "UPDATE snapshot_index SET child_count = MAX(0, child_count - 1) WHERE digest = '{}'",
-                p.replace('\'', "''")
-            ))
+        // Decrement only when positive — equivalent to clamping at 0,
+        // and portable across SQLite and PostgreSQL.
+        snapshot_entity::Entity::update_many()
+            .col_expr(
+                snapshot_entity::Column::ChildCount,
+                Expr::col(snapshot_entity::Column::ChildCount).sub(1),
+            )
+            .filter(snapshot_entity::Column::Digest.eq(p))
+            .filter(snapshot_entity::Column::ChildCount.gt(0))
+            .exec(write_db)
             .await?;
     }
 

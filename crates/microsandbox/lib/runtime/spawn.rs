@@ -20,15 +20,6 @@ use sha2::{Digest as Sha2Digest, Sha256};
 use tempfile::TempDir;
 use tokio::{io::AsyncBufReadExt, process::Command};
 
-use microsandbox_image::{Digest, GlobalCache};
-use microsandbox_metrics::{MetricsRegistry, ReleaseMode, ReserveSlot, SlotReservation};
-use microsandbox_protocol::{
-    ENV_BLOCK_ROOT, ENV_DIR_MOUNTS, ENV_DISK_MOUNTS, ENV_FILE_MOUNTS, ENV_HANDOFF_INIT,
-    ENV_HANDOFF_INIT_ARGS, ENV_HANDOFF_INIT_ENV, ENV_HOSTNAME, ENV_TMPFS, ENV_USER,
-    HANDOFF_INIT_SEP_STR,
-};
-use microsandbox_utils::{DB_FILENAME, DB_SUBDIR};
-
 use crate::{
     MicrosandboxResult, config,
     runtime::handle::ProcessHandle,
@@ -36,6 +27,13 @@ use crate::{
         DiskImageFormat, HostPermissions, Rlimit, RootfsSource, SandboxConfig, StatVirtualization,
         VolumeMount,
     },
+};
+use microsandbox_image::{Digest, GlobalCache};
+use microsandbox_metrics::{MetricsRegistry, ReleaseMode, ReserveSlot, SlotReservation};
+use microsandbox_protocol::{
+    ENV_BLOCK_ROOT, ENV_DIR_MOUNTS, ENV_DISK_MOUNTS, ENV_FILE_MOUNTS, ENV_HANDOFF_INIT,
+    ENV_HANDOFF_INIT_ARGS, ENV_HANDOFF_INIT_ENV, ENV_HOSTNAME, ENV_TMPFS, ENV_USER,
+    HANDOFF_INIT_SEP_STR,
 };
 
 //--------------------------------------------------------------------------------------------------
@@ -99,8 +97,13 @@ pub async fn spawn_sandbox(
     let log_dir = sandbox_dir.join("logs");
     let runtime_dir = sandbox_dir.join("runtime");
     let scripts_dir = runtime_dir.join("scripts");
-    let db_dir = global.home().join(DB_SUBDIR);
-    let db_path = db_dir.join(DB_FILENAME);
+    // The same URL the host resolved for its own pools; passed to the
+    // supervisor via the environment so a `postgres://` URL's credentials
+    // stay out of the process command line. The schema (Postgres-only,
+    // optional) is passed alongside so the supervisor writes into the
+    // same namespace.
+    let db_url = crate::config::database_url();
+    let db_schema = crate::config::database_schema();
 
     // Create directories concurrently.
     tokio::try_join!(
@@ -144,7 +147,6 @@ pub async fn spawn_sandbox(
     cmd.args(sandbox_cli_args(
         config,
         sandbox_id,
-        &db_path,
         global.database.connect_timeout_secs,
         &log_dir,
         &runtime_dir,
@@ -153,6 +155,10 @@ pub async fn spawn_sandbox(
         &staged_file_mounts,
         metrics_reservation.as_ref(),
     ));
+    cmd.env("MSB_DATABASE_URL", &db_url);
+    if let Some(schema) = &db_schema {
+        cmd.env("MSB_DATABASE_SCHEMA", schema);
+    }
 
     // Prevent the sandbox process from inheriting the parent's terminal on
     // stdin — the VMM's implicit console auto-detects terminals and sets raw
@@ -626,11 +632,14 @@ fn guest_mount_tag(guest_path: &str) -> String {
 }
 
 /// Build the `msb sandbox` CLI args for a sandbox.
+///
+/// The database URL is *not* an argument — it is passed to the supervisor
+/// through the `MSB_DATABASE_URL` environment variable so credentials in a
+/// `postgres://` URL never land in the process command line.
 #[allow(clippy::too_many_arguments)]
 fn sandbox_cli_args(
     config: &SandboxConfig,
     sandbox_id: i32,
-    db_path: &Path,
     db_connect_timeout_secs: u64,
     log_dir: &Path,
     runtime_dir: &Path,
@@ -649,8 +658,6 @@ fn sandbox_cli_args(
     args.push(OsString::from(&config.name));
     args.push(OsString::from("--sandbox-id"));
     args.push(OsString::from(sandbox_id.to_string()));
-    args.push(OsString::from("--db-path"));
-    args.push(db_path.as_os_str().to_os_string());
     args.push(OsString::from("--db-connect-timeout-secs"));
     args.push(OsString::from(db_connect_timeout_secs.to_string()));
     args.push(OsString::from("--log-dir"));
@@ -971,7 +978,6 @@ mod tests {
         sandbox_cli_args(
             config,
             42,
-            Path::new("/tmp/msb.db"),
             30,
             Path::new("/tmp/logs"),
             Path::new("/tmp/runtime"),
@@ -992,7 +998,6 @@ mod tests {
         sandbox_cli_args(
             config,
             42,
-            Path::new("/tmp/msb.db"),
             30,
             Path::new("/tmp/logs"),
             Path::new("/tmp/runtime"),
@@ -1188,7 +1193,6 @@ mod tests {
         let args = sandbox_cli_args(
             &config,
             42,
-            Path::new("/tmp/msb.db"),
             30,
             Path::new("/tmp/logs"),
             Path::new("/tmp/runtime"),
@@ -1320,7 +1324,6 @@ mod tests {
         let rendered = sandbox_cli_args(
             &config,
             42,
-            Path::new("/tmp/msb.db"),
             30,
             Path::new("/tmp/logs"),
             Path::new("/tmp/runtime"),

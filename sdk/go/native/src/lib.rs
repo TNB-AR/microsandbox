@@ -584,6 +584,50 @@ pub unsafe extern "C" fn msb_set_sdk_msb_path(path: *const c_char) {
 }
 
 // ---------------------------------------------------------------------------
+// msb_set_database_url
+// ---------------------------------------------------------------------------
+
+/// Set the database connection URL (e.g. `postgres://...` or
+/// `sqlite://...`). Must be called before any sandbox/DB operation.
+/// Set-once: subsequent calls are ignored. Null or invalid-UTF-8 inputs
+/// are silently ignored.
+///
+/// # Safety
+/// `url` must be either null or a valid null-terminated UTF-8 C string
+/// owned by the caller for the duration of this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn msb_set_database_url(url: *const c_char) {
+    if url.is_null() {
+        return;
+    }
+    if let Ok(s) = unsafe { CStr::from_ptr(url) }.to_str() {
+        microsandbox::config::set_database_url(s);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// msb_set_database_schema
+// ---------------------------------------------------------------------------
+
+/// Set the PostgreSQL schema (`search_path`) for this process. Must be
+/// called before any sandbox/DB operation. Set-once: subsequent calls are
+/// ignored. Null or invalid-UTF-8 inputs are silently ignored. Ignored
+/// on SQLite.
+///
+/// # Safety
+/// `name` must be either null or a valid null-terminated UTF-8 C string
+/// owned by the caller for the duration of this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn msb_set_database_schema(name: *const c_char) {
+    if name.is_null() {
+        return;
+    }
+    if let Ok(s) = unsafe { CStr::from_ptr(name) }.to_str() {
+        microsandbox::config::set_database_schema(s);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Cancellation entry points
 //
 // Usage from Go (in call()):

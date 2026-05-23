@@ -115,9 +115,10 @@ impl MigrationTrait for Migration {
             )
             .await?;
 
-        // SQLite-specific partial unique index: enforce name uniqueness
-        // only when name is not NULL. Mirrors the pattern in migration
-        // 0003 for sandbox-independent snapshots.
+        // Partial unique index: enforce name uniqueness only when name is
+        // not NULL. Partial indexes (`CREATE UNIQUE INDEX ... WHERE ...`)
+        // are supported by both SQLite and PostgreSQL with identical
+        // syntax. Mirrors the pattern in migration 0003.
         manager
             .get_connection()
             .execute_unprepared(
