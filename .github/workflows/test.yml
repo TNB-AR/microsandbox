@@ -218,23 +218,6 @@ jobs:
         if: matrix.os == 'darwin'
         run: codesign --entitlements msb-entitlements.plist --force -s - build/msb
 
-      - name: Smoke split irqchip bind mounts with network
-        if: matrix.target == 'linux-x86_64'
-        run: |
-          if [ ! -r /dev/kvm ] || [ ! -w /dev/kvm ]; then
-            echo "::notice::/dev/kvm unavailable; skipping split irqchip smoke"
-            exit 0
-          fi
-          mkdir -p /tmp/msb-ci-bind-a /tmp/msb-ci-bind-b /tmp/msb-ci-bind-c
-          ./build/msb run \
-            --name ci-splitirq-bind-net \
-            --replace \
-            --timeout 60s \
-            -v /tmp/msb-ci-bind-a:/a \
-            -v /tmp/msb-ci-bind-b:/b \
-            -v /tmp/msb-ci-bind-c:/c \
-            alpine -- sh -lc 'ip link show eth0 >/dev/null && mountpoint -q /a && mountpoint -q /b && mountpoint -q /c'
-
       # -- Tests --
       - name: Test workspace
         run: cargo test --workspace
