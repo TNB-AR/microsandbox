@@ -131,3 +131,16 @@ parking_lot = "0.12"
 rpassword = "7"
 russh = "0.61.0"
 russh-sftp = "2.2.2"
+
+[patch.crates-io]
+msb_krun = { git = "https://github.com/superradcompany/libkrun.git", branch = "appcypher/fix-split-irqchip" }
+msb_krun_arch = { git = "https://github.com/superradcompany/libkrun.git", branch = "appcypher/fix-split-irqchip" }
+msb_krun_arch_gen = { git = "https://github.com/superradcompany/libkrun.git", branch = "appcypher/fix-split-irqchip" }
+msb_krun_cpuid = { git = "https://github.com/superradcompany/libkrun.git", branch = "appcypher/fix-split-irqchip" }
+msb_krun_devices = { git = "https://github.com/superradcompany/libkrun.git", branch = "appcypher/fix-split-irqchip" }
+msb_krun_hvf = { git = "https://github.com/superradcompany/libkrun.git", branch = "appcypher/fix-split-irqchip" }
+msb_krun_kernel = { git = "https://github.com/superradcompany/libkrun.git", branch = "appcypher/fix-split-irqchip" }
+msb_krun_polly = { git = "https://github.com/superradcompany/libkrun.git", branch = "appcypher/fix-split-irqchip" }
+msb_krun_smbios = { git = "https://github.com/superradcompany/libkrun.git", branch = "appcypher/fix-split-irqchip" }
+msb_krun_utils = { git = "https://github.com/superradcompany/libkrun.git", branch = "appcypher/fix-split-irqchip" }
+msb_krun_vmm = { git = "https://github.com/superradcompany/libkrun.git", branch = "appcypher/fix-split-irqchip" }
