@@ -829,7 +829,7 @@ Named scripts mounted at `/.msb/scripts/<name>`. Called repeatedly, entries merg
 func WithPullPolicy(p PullPolicy) SandboxOption
 ```
 
-Image pull behaviour. See [`PullPolicy`](#pullpolicy).
+Image pull behavior. See [`PullPolicy`](#pullpolicy).
 
 ---
 
@@ -985,7 +985,7 @@ The config struct populated by [`SandboxOption`](#sandboxoption) functions. Most
 | LogLevel         | [`LogLevel`](#loglevel)                              | Sandbox log verbosity override                                       |
 | QuietLogs        | `bool`                                               | Suppress sandbox-level log output                                    |
 | Scripts          | `map[string]string`                                  | Named scripts mounted at `/.msb/scripts/`                            |
-| PullPolicy       | [`PullPolicy`](#pullpolicy)                          | Image pull behaviour                                                 |
+| PullPolicy       | [`PullPolicy`](#pullpolicy)                          | Image pull behavior                                                  |
 | MaxDuration      | `time.Duration`                                      | Maximum sandbox lifetime                                             |
 | IdleTimeout      | `time.Duration`                                      | Idle timeout                                                         |
 | RegistryAuth     | [`*RegistryAuth`](#registryauth)                     | Private registry credentials                                         |
