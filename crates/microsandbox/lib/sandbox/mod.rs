@@ -14,6 +14,8 @@ mod handle;
 pub mod init;
 pub(crate) mod metrics;
 mod patch;
+#[cfg(feature = "ssh")]
+pub mod ssh;
 mod types;
 
 use std::{collections::HashMap, path::Path, process::ExitStatus, sync::Arc};
@@ -82,7 +84,7 @@ pub use attach::AttachOptionsBuilder;
 pub use builder::{RegistryConfigBuilder, SandboxBuilder};
 pub use config::SandboxConfig;
 pub use exec::{ExecOptionsBuilder, ExecOutput, Rlimit, RlimitResource};
-pub use fs::{FsEntry, FsEntryKind, FsMetadata, FsReadStream, FsWriteSink, SandboxFs};
+pub use fs::{FsEntry, FsEntryKind, FsMetadata, FsReadStream, FsSetAttrs, FsWriteSink, SandboxFs};
 pub use handle::SandboxHandle;
 pub use init::{HandoffInit, InitOptionsBuilder};
 pub use metrics::{SandboxMetrics, all_sandbox_metrics};
@@ -94,6 +96,12 @@ pub use microsandbox_network::config::NetworkConfig;
 #[cfg(feature = "net")]
 pub use microsandbox_network::policy::NetworkPolicy;
 pub use microsandbox_runtime::logging::LogLevel;
+#[cfg(feature = "ssh")]
+pub use ssh::{
+    DEFAULT_SSH_HOST, DEFAULT_SSH_PORT, SandboxSsh, SftpClient, SshAttachOptionsBuilder, SshClient,
+    SshClientOptionsBuilder, SshExecOptionsBuilder, SshOutput, SshServer, SshServerOptionsBuilder,
+    SshStdioStream,
+};
 pub use types::{
     DiskImageFormat, HostPermissions, ImageBuilder, ImageSource, IntoImage, MountBuilder,
     MountOptions, OciRootfsSource, Patch, PatchBuilder, RootfsSource, StatVirtualization,
@@ -343,6 +351,8 @@ pub(crate) async fn create_local(
                 available_when: "with a LocalBackend".into(),
             })?;
 
+    config.apply_rootfs_defaults(local_backend.config().sandbox_defaults.oci.upper_size_mib);
+
     let mut pinned_manifest_digest: Option<String> = None;
     let mut pinned_reference: Option<String> = None;
 
@@ -358,6 +368,9 @@ pub(crate) async fn create_local(
     // Resolve OCI images before spawning the sandbox process.
     if let RootfsSource::Oci(oci) = config.image.clone() {
         let reference = oci.reference;
+        let upper_size_mib = oci
+            .upper_size_mib
+            .unwrap_or(config::DEFAULT_OCI_UPPER_SIZE_MIB);
         let overrides = RegistryOverrides {
             auth: config.registry_auth.clone(),
             insecure: config.insecure,
@@ -423,7 +436,7 @@ pub(crate) async fn create_local(
             .await
             .map_err(|e| crate::MicrosandboxError::Custom(format!("snapshot copy task: {e}")))??;
         } else if !upper_path.exists() || upper_tree.is_some() {
-            create_upper_ext4(&upper_path, upper_tree).await?;
+            create_upper_ext4(&upper_path, upper_size_mib, upper_tree).await?;
         }
 
         // Store manifest digest for spawn to derive paths.
@@ -930,7 +943,7 @@ impl Sandbox {
     /// Routes through the [`SandboxBackend`](crate::backend::SandboxBackend)
     /// trait. Local reads the on-disk JSON Lines file the runtime writes via
     /// the relay tap (`crates/runtime/lib/exec_log.rs`); cloud returns
-    /// `Unsupported` until cloud logs land.
+    /// `Unsupported` until bounded cloud log snapshots land.
     pub async fn logs(&self, opts: &LogOptions) -> MicrosandboxResult<Vec<LogEntry>> {
         self.backend
             .sandboxes()
@@ -941,21 +954,16 @@ impl Sandbox {
     /// Stream log entries for this sandbox.
     ///
     /// Local streams the on-disk JSON Lines files produced by the relay tap;
-    /// cloud returns `Unsupported` until cloud logs land.
+    /// cloud streams the msb-cloud SSE logs endpoint and maps each event into
+    /// a typed [`LogEntry`].
     pub async fn log_stream(
         &self,
         opts: &LogStreamOptions,
-    ) -> MicrosandboxResult<
-        impl futures::Stream<Item = MicrosandboxResult<LogEntry>> + Send + 'static + use<>,
-    > {
-        if self.local().is_none() {
-            return Err(crate::MicrosandboxError::Unsupported {
-                feature: "Sandbox::log_stream on cloud".into(),
-                available_when: "when cloud logs land".into(),
-            });
-        }
-
-        crate::logs::log_stream(&self.name, opts).await
+    ) -> MicrosandboxResult<crate::backend::sandbox::LogStream> {
+        self.backend
+            .sandboxes()
+            .log_stream(self.backend.clone(), &self.name, opts)
+            .await
     }
 
     /// Low-level access to the guest agent client.
@@ -1214,6 +1222,26 @@ impl Sandbox {
             .await
     }
 
+    /// Run a shell command with full options and wait for completion.
+    pub async fn shell_with(
+        &self,
+        script: impl Into<String>,
+        f: impl FnOnce(ExecOptionsBuilder) -> ExecOptionsBuilder,
+    ) -> MicrosandboxResult<ExecOutput> {
+        let shell = self
+            .config
+            .shell
+            .as_deref()
+            .unwrap_or("/bin/sh")
+            .to_string();
+        let mut opts = f(ExecOptionsBuilder::default()).build()?;
+        opts.args.splice(0..0, ["-c".to_string(), script.into()]);
+        self.backend
+            .sandboxes()
+            .exec(self.backend.clone(), &self.name, &self.config, shell, opts)
+            .await
+    }
+
     /// Run a shell command with streaming I/O.
     ///
     /// Like [`shell`](Self::shell) but returns a streaming [`ExecHandle`]
@@ -1229,6 +1257,26 @@ impl Sandbox {
             args: vec!["-c".to_string(), script.into()],
             ..Default::default()
         };
+        self.backend
+            .sandboxes()
+            .exec_stream(self.backend.clone(), &self.name, &self.config, shell, opts)
+            .await
+    }
+
+    /// Run a shell command with full options and streaming I/O.
+    pub async fn shell_stream_with(
+        &self,
+        script: impl Into<String>,
+        f: impl FnOnce(ExecOptionsBuilder) -> ExecOptionsBuilder,
+    ) -> MicrosandboxResult<ExecHandle> {
+        let shell = self
+            .config
+            .shell
+            .as_deref()
+            .unwrap_or("/bin/sh")
+            .to_string();
+        let mut opts = f(ExecOptionsBuilder::default()).build()?;
+        opts.args.splice(0..0, ["-c".to_string(), script.into()]);
         self.backend
             .sandboxes()
             .exec_stream(self.backend.clone(), &self.name, &self.config, shell, opts)
@@ -2206,10 +2254,14 @@ async fn replace_oci_manifest_pin<C: ConnectionTrait>(
 /// Create a sparse ext4 image for the writable overlay upper layer.
 async fn create_upper_ext4(
     path: &std::path::Path,
+    size_mib: u32,
     tree: Option<tree::FileTree>,
 ) -> MicrosandboxResult<()> {
     let _ = tokio::fs::remove_file(path).await;
-    let ext4_options = ext4::Ext4FormatOptions::default();
+    let ext4_options = ext4::Ext4FormatOptions {
+        size_bytes: u64::from(size_mib) * 1024 * 1024,
+        ..Default::default()
+    };
     let overlay_tree = build_overlay_upper_tree(tree);
     let path = path.to_path_buf();
 

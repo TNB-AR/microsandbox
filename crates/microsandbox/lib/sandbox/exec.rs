@@ -547,6 +547,18 @@ pub(crate) mod local {
         cmd: String,
         opts: ExecOptions,
     ) -> MicrosandboxResult<ExecHandle> {
+        exec_stream_with_pty_size(local, name, config, cmd, opts, 24, 80).await
+    }
+
+    pub(crate) async fn exec_stream_with_pty_size(
+        local: &LocalBackend,
+        name: &str,
+        config: &SandboxConfig,
+        cmd: String,
+        opts: ExecOptions,
+        rows: u16,
+        cols: u16,
+    ) -> MicrosandboxResult<ExecHandle> {
         let client = Arc::new(super::super::fs::local::connect_agent(local, name).await?);
         let ExecOptions {
             args,
@@ -568,7 +580,9 @@ pub(crate) mod local {
             "exec_stream"
         );
 
-        let req = build_exec_request(config, cmd, args, cwd, user, &env, &rlimits, tty, 24, 80);
+        let req = build_exec_request(
+            config, cmd, args, cwd, user, &env, &rlimits, tty, rows, cols,
+        );
         let (id, rx) = client.stream(MessageType::ExecRequest, &req).await?;
 
         let stdin = match &stdin_mode {

@@ -8,16 +8,22 @@
 //! Auth is API-key-only — the same `msb_live_*` / `msb_test_*` tokens msb-cloud
 //! issues today. No OAuth or session credentials are honored here.
 
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
+use bytes::Bytes;
+use futures::{StreamExt, stream};
 use reqwest::Response;
-use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue, USER_AGENT};
+use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderName, HeaderValue, USER_AGENT};
+use serde::Deserialize;
+use tokio::sync::mpsc;
 
 use super::cloud_wire::{
     CloudCreateSandboxRequest, CloudErrorBody, CloudMessageResponse, CloudPaginated, CloudSandbox,
 };
-use super::{Backend, BackendKind, SandboxBackend, VolumeBackend};
+use super::{Backend, BackendKind, SandboxBackend, VolumeBackend, sandbox::LogStream};
+use crate::logs::{LogCursor, LogEntry, LogOptions, LogSource, LogStreamOptions, LogStreamStart};
 use crate::{MicrosandboxError, MicrosandboxResult};
 
 //--------------------------------------------------------------------------------------------------
@@ -70,6 +76,26 @@ pub struct CloudBackendBuilder {
     request_timeout: Duration,
     user_agent: Option<String>,
     custom_client: Option<reqwest::Client>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CloudLogPayload {
+    source: String,
+    ts: chrono::DateTime<chrono::Utc>,
+    text: String,
+}
+
+#[derive(Default)]
+struct CloudSseEvent {
+    id: Option<String>,
+    event: Option<String>,
+    data: String,
+}
+
+enum CloudSseItem {
+    Entry(LogEntry),
+    End,
+    Ignore,
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -239,6 +265,244 @@ impl CloudBackend {
             .await
             .map_err(|e| cloud_io_error("DELETE /v1/sandboxes/by-name/:name", e))?;
         decode_json(resp, "DELETE /v1/sandboxes/by-name/:name").await
+    }
+
+    /// Stream logs from `GET /v1/sandboxes/:id/logs`.
+    ///
+    /// msb-cloud exposes logs as Server-Sent Events keyed by sandbox UUID, so
+    /// the SDK resolves the current name to a cloud sandbox first. The cloud
+    /// endpoint is streaming-only and requires a running sandbox, so callers
+    /// must set `follow: true`.
+    pub async fn log_stream(
+        &self,
+        name: &str,
+        opts: &LogStreamOptions,
+    ) -> MicrosandboxResult<LogStream> {
+        if !opts.follow {
+            return Err(MicrosandboxError::Unsupported {
+                feature: "Sandbox::log_stream(follow=false) on cloud".into(),
+                available_when: "when msb-cloud exposes bounded log snapshots".into(),
+            });
+        }
+
+        let sandbox = self.get_sandbox(name).await?;
+        self.open_log_stream_by_id(&sandbox.id, opts).await
+    }
+
+    /// Read a bounded log snapshot.
+    pub async fn logs(&self, _name: &str, _opts: &LogOptions) -> MicrosandboxResult<Vec<LogEntry>> {
+        Err(MicrosandboxError::Unsupported {
+            feature: "Sandbox::logs on cloud".into(),
+            available_when: "when msb-cloud exposes bounded log snapshots; use Sandbox::log_stream with follow=true for live logs".into(),
+        })
+    }
+
+    async fn open_log_stream_by_id(
+        &self,
+        sandbox_id: &str,
+        opts: &LogStreamOptions,
+    ) -> MicrosandboxResult<LogStream> {
+        let mut query = Vec::new();
+        let cloud_sources = cloud_log_sources(&opts.sources)?;
+        if !cloud_sources.is_empty() {
+            query.push(format!("sources={}", cloud_sources.join(",")));
+        }
+
+        let mut url = format!("{}/v1/sandboxes/{}/logs", self.url, urlencoding(sandbox_id));
+        if !query.is_empty() {
+            url.push('?');
+            url.push_str(&query.join("&"));
+        }
+
+        let mut request = self
+            .http
+            .get(&url)
+            .header(ACCEPT, HeaderValue::from_static("text/event-stream"));
+        if let LogStreamStart::From(cursor) = &opts.start {
+            request = request.header(HeaderName::from_static("last-event-id"), cursor.to_string());
+        }
+
+        let resp = request
+            .send()
+            .await
+            .map_err(|e| cloud_io_error("GET /v1/sandboxes/:id/logs", e))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body_text = resp.text().await.unwrap_or_default();
+            let typed: Option<CloudErrorBody> = serde_json::from_str(&body_text).ok();
+            return Err(cloud_http_error(
+                status.as_u16(),
+                typed.as_ref(),
+                &body_text,
+                "GET /v1/sandboxes/:id/logs",
+            ));
+        }
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        let opts = opts.clone();
+        tokio::spawn(async move {
+            parse_cloud_log_sse(Box::pin(resp.bytes_stream()), opts, tx).await;
+        });
+
+        Ok(Box::pin(stream::unfold(rx, |mut rx| async {
+            rx.recv().await.map(|item| (item, rx))
+        })))
+    }
+}
+
+//--------------------------------------------------------------------------------------------------
+// Functions: Logs
+//--------------------------------------------------------------------------------------------------
+
+async fn parse_cloud_log_sse(
+    mut chunks: Pin<Box<dyn futures::Stream<Item = Result<Bytes, reqwest::Error>> + Send>>,
+    opts: LogStreamOptions,
+    tx: mpsc::UnboundedSender<MicrosandboxResult<LogEntry>>,
+) {
+    let mut buffer = Vec::new();
+
+    while let Some(chunk) = chunks.next().await {
+        match chunk {
+            Ok(bytes) => buffer.extend_from_slice(&bytes),
+            Err(error) => {
+                let _ = tx.send(Err(MicrosandboxError::Http(error)));
+                return;
+            }
+        }
+
+        while let Some((block, consumed)) = take_sse_block(&buffer) {
+            buffer.drain(..consumed);
+            match parse_cloud_sse_item(&block, &opts) {
+                Ok(CloudSseItem::Entry(entry)) => {
+                    if tx.send(Ok(entry)).is_err() {
+                        return;
+                    }
+                }
+                Ok(CloudSseItem::End) => return,
+                Ok(CloudSseItem::Ignore) => {}
+                Err(error) => {
+                    let _ = tx.send(Err(error));
+                    return;
+                }
+            }
+        }
+    }
+}
+
+fn take_sse_block(buffer: &[u8]) -> Option<(Vec<u8>, usize)> {
+    for i in 0..buffer.len() {
+        if i + 3 < buffer.len() && &buffer[i..i + 4] == b"\r\n\r\n" {
+            return Some((buffer[..i].to_vec(), i + 4));
+        }
+        if i + 1 < buffer.len() && &buffer[i..i + 2] == b"\n\n" {
+            return Some((buffer[..i].to_vec(), i + 2));
+        }
+    }
+    None
+}
+
+fn parse_cloud_sse_item(block: &[u8], opts: &LogStreamOptions) -> MicrosandboxResult<CloudSseItem> {
+    let event = parse_cloud_sse_event(block)?;
+    match event.event.as_deref().unwrap_or("message") {
+        "log" => cloud_log_event_to_entry(event, opts),
+        "end" => Ok(CloudSseItem::End),
+        _ => Ok(CloudSseItem::Ignore),
+    }
+}
+
+fn parse_cloud_sse_event(block: &[u8]) -> MicrosandboxResult<CloudSseEvent> {
+    let text = std::str::from_utf8(block)
+        .map_err(|e| MicrosandboxError::Custom(format!("invalid cloud log SSE utf-8: {e}")))?;
+    let mut event = CloudSseEvent::default();
+
+    for raw_line in text.lines() {
+        let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
+        if line.is_empty() || line.starts_with(':') {
+            continue;
+        }
+        let (field, value) = line
+            .split_once(':')
+            .map(|(field, value)| (field, value.strip_prefix(' ').unwrap_or(value)))
+            .unwrap_or((line, ""));
+        match field {
+            "id" => event.id = Some(value.to_string()),
+            "event" => event.event = Some(value.to_string()),
+            "data" => {
+                if !event.data.is_empty() {
+                    event.data.push('\n');
+                }
+                event.data.push_str(value);
+            }
+            _ => {}
+        }
+    }
+
+    Ok(event)
+}
+
+fn cloud_log_event_to_entry(
+    event: CloudSseEvent,
+    opts: &LogStreamOptions,
+) -> MicrosandboxResult<CloudSseItem> {
+    let payload: CloudLogPayload = serde_json::from_str(&event.data)
+        .map_err(|e| MicrosandboxError::Custom(format!("invalid cloud log event payload: {e}")))?;
+
+    if let Some(until) = opts.until
+        && payload.ts >= until
+    {
+        return Ok(CloudSseItem::End);
+    }
+    if let LogStreamStart::Since(since) = opts.start
+        && payload.ts < since
+    {
+        return Ok(CloudSseItem::Ignore);
+    }
+
+    let source = parse_cloud_log_source(&payload.source)?;
+    let cursor = match event.id {
+        Some(id) if !id.is_empty() => id
+            .parse::<LogCursor>()
+            .map_err(|e| MicrosandboxError::InvalidCursor(e.to_string()))?,
+        _ => LogCursor::empty(),
+    };
+
+    Ok(CloudSseItem::Entry(LogEntry {
+        timestamp: payload.ts,
+        source,
+        session_id: None,
+        data: Bytes::from(payload.text),
+        cursor,
+    }))
+}
+
+fn cloud_log_sources(requested: &[LogSource]) -> MicrosandboxResult<Vec<String>> {
+    if requested.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    LogSource::effective(requested)
+        .into_iter()
+        .map(|source| match source {
+            LogSource::Stdout => Ok("stdout".to_string()),
+            LogSource::Stderr => Ok("stderr".to_string()),
+            LogSource::System => Ok("system".to_string()),
+            LogSource::Output => Err(MicrosandboxError::Unsupported {
+                feature: "cloud log source 'output'".into(),
+                available_when: "when msb-cloud accepts the output log source".into(),
+            }),
+        })
+        .collect()
+}
+
+fn parse_cloud_log_source(source: &str) -> MicrosandboxResult<LogSource> {
+    match source {
+        "stdout" => Ok(LogSource::Stdout),
+        "stderr" => Ok(LogSource::Stderr),
+        "system" => Ok(LogSource::System),
+        "output" => Ok(LogSource::Output),
+        other => Err(MicrosandboxError::Custom(format!(
+            "unknown cloud log source: {other}"
+        ))),
     }
 }
 
@@ -564,5 +828,47 @@ mod tests {
         assert!(
             matches!(err, MicrosandboxError::SandboxAlreadyExists(msg) if msg.contains("name taken"))
         );
+    }
+
+    #[test]
+    fn cloud_log_sse_event_maps_to_log_entry() {
+        let cursor = LogCursor::empty().to_string();
+        let block = format!(
+            "id: {cursor}\nevent: log\ndata: {{\"source\":\"stdout\",\"ts\":\"2026-05-31T10:00:00Z\",\"text\":\"hello\"}}"
+        );
+
+        let item = parse_cloud_sse_item(block.as_bytes(), &LogStreamOptions::default()).unwrap();
+
+        let CloudSseItem::Entry(entry) = item else {
+            panic!("expected log entry");
+        };
+        assert_eq!(entry.source, LogSource::Stdout);
+        assert_eq!(entry.data, Bytes::from_static(b"hello"));
+        assert_eq!(entry.cursor.to_string(), cursor);
+    }
+
+    #[test]
+    fn cloud_log_sse_since_filters_old_entries() {
+        let opts = LogStreamOptions {
+            start: LogStreamStart::Since(
+                "2026-05-31T10:00:01Z"
+                    .parse::<chrono::DateTime<chrono::Utc>>()
+                    .unwrap(),
+            ),
+            ..Default::default()
+        };
+        let block =
+            b"event: log\ndata: {\"source\":\"stderr\",\"ts\":\"2026-05-31T10:00:00Z\",\"text\":\"old\"}";
+
+        let item = parse_cloud_sse_item(block, &opts).unwrap();
+
+        assert!(matches!(item, CloudSseItem::Ignore));
+    }
+
+    #[test]
+    fn cloud_log_sources_rejects_output_until_cloud_supports_it() {
+        let err = cloud_log_sources(&[LogSource::Output]).unwrap_err();
+
+        assert!(matches!(err, MicrosandboxError::Unsupported { .. }));
     }
 }

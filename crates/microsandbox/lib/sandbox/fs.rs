@@ -15,7 +15,11 @@ use microsandbox_protocol::{
 };
 use tokio::sync::mpsc;
 
-use crate::{MicrosandboxError, MicrosandboxResult, agent::AgentClient, backend::Backend};
+use crate::{
+    MicrosandboxError, MicrosandboxResult,
+    agent::AgentClient,
+    backend::{Backend, LocalBackend},
+};
 
 //--------------------------------------------------------------------------------------------------
 // Types
@@ -250,6 +254,39 @@ impl<'a> SandboxFs<'a> {
             .await
     }
 
+    /// Get file/directory metadata, optionally following symlinks.
+    pub async fn stat_with_follow(
+        &self,
+        path: &str,
+        follow_symlink: bool,
+    ) -> MicrosandboxResult<FsMetadata> {
+        let local = self.local_backend("SandboxFs::stat_with_follow")?;
+        local::stat_with_follow(local, self.name, path, follow_symlink).await
+    }
+
+    /// Update file/directory metadata.
+    pub async fn set_stat(
+        &self,
+        path: &str,
+        follow_symlink: bool,
+        attrs: FsSetAttrs,
+    ) -> MicrosandboxResult<()> {
+        let local = self.local_backend("SandboxFs::set_stat")?;
+        local::set_stat(local, self.name, path, follow_symlink, attrs).await
+    }
+
+    /// Read the target of a symbolic link.
+    pub async fn read_link(&self, path: &str) -> MicrosandboxResult<String> {
+        let local = self.local_backend("SandboxFs::read_link")?;
+        local::read_link(local, self.name, path).await
+    }
+
+    /// Create a symbolic link.
+    pub async fn symlink(&self, target: &str, link_path: &str) -> MicrosandboxResult<()> {
+        let local = self.local_backend("SandboxFs::symlink")?;
+        local::symlink(local, self.name, target, link_path).await
+    }
+
     /// Check whether a file or directory exists at the given path in the guest.
     pub async fn exists(&self, path: &str) -> MicrosandboxResult<bool> {
         self.backend
@@ -294,6 +331,15 @@ impl<'a> SandboxFs<'a> {
                 host_path.as_ref(),
             )
             .await
+    }
+
+    fn local_backend(&self, method: &'static str) -> MicrosandboxResult<&LocalBackend> {
+        self.backend
+            .as_local()
+            .ok_or_else(|| MicrosandboxError::Unsupported {
+                feature: method.into(),
+                available_when: "when cloud guest-fs lands".into(),
+            })
     }
 }
 
@@ -499,7 +545,10 @@ pub(crate) mod local {
 
     use bytes::Bytes;
     use microsandbox_protocol::{
-        fs::{FS_CHUNK_SIZE, FsData, FsOp, FsOpenOptions, FsRequest, FsResponse, FsResponseData},
+        fs::{
+            FS_CHUNK_SIZE, FsData, FsOp, FsOpenOptions, FsRequest, FsResponse, FsResponseData,
+            FsSetAttrs,
+        },
         message::MessageType,
     };
     use tokio::io::AsyncReadExt;
@@ -793,11 +842,20 @@ pub(crate) mod local {
         name: &str,
         path: &str,
     ) -> MicrosandboxResult<FsMetadata> {
+        stat_with_follow(local, name, path, true).await
+    }
+
+    pub(crate) async fn stat_with_follow(
+        local: &LocalBackend,
+        name: &str,
+        path: &str,
+        follow_symlink: bool,
+    ) -> MicrosandboxResult<FsMetadata> {
         let client = connect_agent(local, name).await?;
         let req = FsRequest {
             op: FsOp::Stat {
                 path: path.to_string(),
-                follow_symlink: true,
+                follow_symlink,
             },
         };
         let resp_msg = client.request(MessageType::FsRequest, &req).await?;
@@ -815,6 +873,70 @@ pub(crate) mod local {
                 "unexpected response data for stat".into(),
             )),
         }
+    }
+
+    pub(crate) async fn set_stat(
+        local: &LocalBackend,
+        name: &str,
+        path: &str,
+        follow_symlink: bool,
+        attrs: FsSetAttrs,
+    ) -> MicrosandboxResult<()> {
+        let client = connect_agent(local, name).await?;
+        let req = FsRequest {
+            op: FsOp::SetStat {
+                path: path.to_string(),
+                follow_symlink,
+                attrs,
+            },
+        };
+        let resp_msg = client.request(MessageType::FsRequest, &req).await?;
+        check_response(resp_msg)
+    }
+
+    pub(crate) async fn read_link(
+        local: &LocalBackend,
+        name: &str,
+        path: &str,
+    ) -> MicrosandboxResult<String> {
+        let client = connect_agent(local, name).await?;
+        let req = FsRequest {
+            op: FsOp::ReadLink {
+                path: path.to_string(),
+            },
+        };
+        let resp_msg = client.request(MessageType::FsRequest, &req).await?;
+        let resp: FsResponse = resp_msg.payload()?;
+
+        if !resp.ok {
+            return Err(MicrosandboxError::SandboxFs(
+                resp.error.unwrap_or_else(|| "unknown error".into()),
+            ));
+        }
+
+        match resp.data {
+            Some(FsResponseData::Path(path)) => Ok(path),
+            _ => Err(MicrosandboxError::SandboxFs(
+                "unexpected response data for readlink".into(),
+            )),
+        }
+    }
+
+    pub(crate) async fn symlink(
+        local: &LocalBackend,
+        name: &str,
+        target: &str,
+        link_path: &str,
+    ) -> MicrosandboxResult<()> {
+        let client = connect_agent(local, name).await?;
+        let req = FsRequest {
+            op: FsOp::Symlink {
+                target: target.to_string(),
+                link_path: link_path.to_string(),
+            },
+        };
+        let resp_msg = client.request(MessageType::FsRequest, &req).await?;
+        check_response(resp_msg)
     }
 
     pub(crate) async fn exists(
@@ -859,3 +981,9 @@ pub(crate) mod local {
         Ok(())
     }
 }
+
+//--------------------------------------------------------------------------------------------------
+// Re-Exports
+//--------------------------------------------------------------------------------------------------
+
+pub use microsandbox_protocol::fs::FsSetAttrs;

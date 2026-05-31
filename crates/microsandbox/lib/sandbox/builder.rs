@@ -693,9 +693,9 @@ impl SandboxBuilder {
     /// If [`from_snapshot`](Self::from_snapshot) was called, the snapshot
     /// manifest is opened here and its pinned image reference, manifest
     /// digest, and upper-layer source path are populated onto the config.
+    /// Backend-owned defaults are applied when the config is created, not here.
     pub async fn build(mut self) -> MicrosandboxResult<SandboxConfig> {
         self.resolve_pending().await?;
-        self.config.apply_rootfs_defaults();
         self.validate()?;
         Ok(self.config)
     }
@@ -1037,14 +1037,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_builder_image_applies_default_oci_upper_size() {
+    async fn test_builder_leaves_backend_oci_upper_default_unmaterialized() {
         let config = SandboxBuilder::new("test")
             .image("alpine")
             .build()
             .await
             .unwrap();
 
-        assert_eq!(config.image.oci_upper_size_mib(), Some(4096));
+        assert_eq!(config.image.oci_upper_size_mib(), None);
     }
 
     #[tokio::test]

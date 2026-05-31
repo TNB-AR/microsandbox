@@ -20,7 +20,7 @@ use futures::future::BoxFuture;
 use super::cloud_wire::{CloudCreateSandboxRequest, CloudSandbox, CloudSandboxStatus};
 use super::{Backend, CloudBackend, LocalBackend};
 use crate::agent::AgentClient;
-use crate::logs::{LogEntry, LogOptions};
+use crate::logs::{LogEntry, LogOptions, LogStreamOptions};
 use crate::runtime::{ProcessHandle, SpawnMode};
 use crate::sandbox::exec::{ExecHandle, ExecOptions, ExecOutput};
 use crate::sandbox::fs::{FsEntry, FsMetadata, FsReadStream, FsWriteSink};
@@ -37,6 +37,9 @@ use crate::{MicrosandboxError, MicrosandboxResult};
 /// Boxed stream of metrics samples returned by [`SandboxBackend::metrics_stream`].
 pub type MetricsStream =
     Pin<Box<dyn Stream<Item = MicrosandboxResult<SandboxMetrics>> + Send + 'static>>;
+
+/// Boxed stream of log entries returned by [`SandboxBackend::log_stream`].
+pub type LogStream = Pin<Box<dyn Stream<Item = MicrosandboxResult<LogEntry>> + Send + 'static>>;
 
 //--------------------------------------------------------------------------------------------------
 // Types
@@ -262,6 +265,14 @@ pub trait SandboxBackend: Send + Sync {
         name: &'a str,
         opts: &'a LogOptions,
     ) -> BoxFuture<'a, MicrosandboxResult<Vec<LogEntry>>>;
+
+    /// Stream captured output for the named sandbox.
+    fn log_stream<'a>(
+        &'a self,
+        backend: Arc<dyn Backend>,
+        name: &'a str,
+        opts: &'a LogStreamOptions,
+    ) -> BoxFuture<'a, MicrosandboxResult<LogStream>>;
 
     /// Latest metrics sample for the named sandbox.
     fn metrics<'a>(
@@ -552,6 +563,18 @@ impl SandboxBackend for LocalBackend {
         opts: &'a LogOptions,
     ) -> BoxFuture<'a, MicrosandboxResult<Vec<LogEntry>>> {
         Box::pin(async move { crate::logs::read_logs(name, opts).await })
+    }
+
+    fn log_stream<'a>(
+        &'a self,
+        _backend: Arc<dyn Backend>,
+        name: &'a str,
+        opts: &'a LogStreamOptions,
+    ) -> BoxFuture<'a, MicrosandboxResult<LogStream>> {
+        Box::pin(async move {
+            let stream = crate::logs::log_stream(name, opts).await?;
+            Ok(Box::pin(stream) as LogStream)
+        })
     }
 
     fn metrics<'a>(
@@ -879,7 +902,16 @@ impl SandboxBackend for CloudBackend {
         _name: &'a str,
         _opts: &'a LogOptions,
     ) -> BoxFuture<'a, MicrosandboxResult<Vec<LogEntry>>> {
-        Box::pin(async move { Err(unsupported_logs("Sandbox::logs")) })
+        Box::pin(async move { CloudBackend::logs(self, _name, _opts).await })
+    }
+
+    fn log_stream<'a>(
+        &'a self,
+        _backend: Arc<dyn Backend>,
+        name: &'a str,
+        opts: &'a LogStreamOptions,
+    ) -> BoxFuture<'a, MicrosandboxResult<LogStream>> {
+        Box::pin(async move { CloudBackend::log_stream(self, name, opts).await })
     }
 
     fn metrics<'a>(
@@ -1251,13 +1283,6 @@ fn unsupported_fs(feature: &'static str) -> MicrosandboxError {
     MicrosandboxError::Unsupported {
         feature: feature.into(),
         available_when: "when cloud guest fs lands".into(),
-    }
-}
-
-fn unsupported_logs(feature: &'static str) -> MicrosandboxError {
-    MicrosandboxError::Unsupported {
-        feature: feature.into(),
-        available_when: "when cloud logs land".into(),
     }
 }
 

@@ -22,7 +22,7 @@ use super::{
 const DEFAULT_OCI_TMPFS_PATH: &str = "/tmp";
 const DEFAULT_OCI_TMPFS_MAX_SIZE_MIB: u32 = 512;
 const DEFAULT_OCI_TMPFS_MEMORY_DIVISOR: u32 = 4;
-const DEFAULT_OCI_UPPER_SIZE_MIB: u32 = 4 * 1024;
+pub(crate) const DEFAULT_OCI_UPPER_SIZE_MIB: u32 = 4 * 1024;
 
 /// Default timeout given to the existing sandbox during a `.replace()`
 /// create before it is force-killed.
@@ -211,7 +211,7 @@ pub struct SandboxConfig {
     ///
     /// Only consulted when `replace_existing` is true. A zero duration
     /// skips SIGTERM entirely and goes straight to SIGKILL. Default is
-    /// [`DEFAULT_REPLACE_TIMEOUT`], which gives the exit observer plenty
+    /// `DEFAULT_REPLACE_TIMEOUT`, which gives the exit observer plenty
     /// of headroom to flush logs and clean up the agent socket on a
     /// healthy sandbox before we escalate.
     ///
@@ -280,12 +280,12 @@ impl SandboxConfig {
     }
 
     /// Materialize rootfs defaults that should be persisted with the sandbox.
-    pub(crate) fn apply_rootfs_defaults(&mut self) {
+    pub(crate) fn apply_rootfs_defaults(&mut self, upper_size_mib: Option<u32>) {
         if self.snapshot_upper_source.is_none()
             && let RootfsSource::Oci(oci) = &mut self.image
             && oci.upper_size_mib.is_none()
         {
-            oci.upper_size_mib = Some(DEFAULT_OCI_UPPER_SIZE_MIB);
+            oci.upper_size_mib = Some(upper_size_mib.unwrap_or(DEFAULT_OCI_UPPER_SIZE_MIB));
         }
     }
 
@@ -605,9 +605,21 @@ mod tests {
             ..Default::default()
         };
 
-        config.apply_rootfs_defaults();
+        config.apply_rootfs_defaults(None);
 
         assert_eq!(config.image.oci_upper_size_mib(), Some(4096));
+    }
+
+    #[test]
+    fn test_apply_rootfs_defaults_uses_backend_oci_upper_size() {
+        let mut config = SandboxConfig {
+            image: RootfsSource::oci("python:3.12"),
+            ..Default::default()
+        };
+
+        config.apply_rootfs_defaults(Some(8192));
+
+        assert_eq!(config.image.oci_upper_size_mib(), Some(8192));
     }
 
     #[test]
@@ -618,7 +630,7 @@ mod tests {
             ..Default::default()
         };
 
-        config.apply_rootfs_defaults();
+        config.apply_rootfs_defaults(Some(8192));
 
         assert_eq!(config.image.oci_upper_size_mib(), None);
     }

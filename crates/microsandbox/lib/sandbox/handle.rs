@@ -279,6 +279,15 @@ impl SandboxHandle {
     /// handles only** — cloud sandbox attach is HTTP/WS and not wired up in
     /// this delegation.
     pub async fn connect(&self) -> MicrosandboxResult<Sandbox> {
+        self.connect_with_timeout(std::time::Duration::from_secs(10))
+            .await
+    }
+
+    /// Connect to a running sandbox with an explicit agent handshake timeout.
+    pub async fn connect_with_timeout(
+        &self,
+        timeout: std::time::Duration,
+    ) -> MicrosandboxResult<Sandbox> {
         let local = self
             .local()
             .ok_or_else(|| crate::MicrosandboxError::Unsupported {
@@ -305,22 +314,14 @@ impl SandboxHandle {
             .join("runtime")
             .join("agent.sock");
 
-        // Bound the handshake reads. The relay is supposed to be running
-        // already for a sandbox in Running/Draining state; if it doesn't
-        // respond within 10s, something is wedged and the caller should
-        // see a timeout instead of hanging forever.
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-        let client = tokio::time::timeout(
-            deadline.saturating_duration_since(tokio::time::Instant::now()),
-            AgentClient::connect(&sock_path),
-        )
-        .await
-        .map_err(|_| {
-            crate::MicrosandboxError::Runtime(format!(
-                "timed out connecting to sandbox '{}' agent",
-                self.name
-            ))
-        })??;
+        let client = tokio::time::timeout(timeout, AgentClient::connect(&sock_path))
+            .await
+            .map_err(|_| {
+                crate::MicrosandboxError::Runtime(format!(
+                    "timed out connecting to sandbox '{}' agent",
+                    self.name
+                ))
+            })??;
         let config: SandboxConfig = serde_json::from_str(&local.config_json)?;
 
         Ok(Sandbox::from_local(
@@ -387,6 +388,38 @@ impl SandboxHandle {
             .sandboxes()
             .stop(self.backend.clone(), &self.name)
             .await
+    }
+
+    /// Stop the sandbox gracefully, then kill it if it is still alive after `timeout`.
+    ///
+    /// Cloud handles currently issue the stop request and return immediately
+    /// because there is no host process to wait on.
+    pub async fn stop_with_timeout(&self, timeout: std::time::Duration) -> MicrosandboxResult<()> {
+        self.stop().await?;
+
+        let Some(local) = self.local() else {
+            return Ok(());
+        };
+        let Some(pid) = local.pid else {
+            return Ok(());
+        };
+
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if !super::pid_is_alive(pid) {
+                return Ok(());
+            }
+
+            if tokio::time::Instant::now() >= deadline {
+                return self
+                    .backend
+                    .sandboxes()
+                    .kill(self.backend.clone(), &self.name)
+                    .await;
+            }
+
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
     }
 
     /// Kill the sandbox immediately (SIGKILL).
