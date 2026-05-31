@@ -20,12 +20,14 @@ use futures::future::BoxFuture;
 use super::cloud_wire::{CloudCreateSandboxRequest, CloudSandbox, CloudSandboxStatus};
 use super::{Backend, CloudBackend, LocalBackend};
 use crate::agent::AgentClient;
+use crate::logs::{LogEntry, LogOptions};
 use crate::runtime::{ProcessHandle, SpawnMode};
 use crate::sandbox::exec::{ExecHandle, ExecOptions, ExecOutput};
 use crate::sandbox::fs::{FsEntry, FsMetadata, FsReadStream, FsWriteSink};
-use crate::sandbox::logs::{LogEntry, LogOptions};
 use crate::sandbox::metrics::SandboxMetrics;
-use crate::sandbox::{RootfsSource, Sandbox, SandboxConfig, SandboxHandle, SandboxStatus};
+use crate::sandbox::{
+    OciRootfsSource, RootfsSource, Sandbox, SandboxConfig, SandboxHandle, SandboxStatus,
+};
 use crate::{MicrosandboxError, MicrosandboxResult};
 
 //--------------------------------------------------------------------------------------------------
@@ -549,7 +551,7 @@ impl SandboxBackend for LocalBackend {
         name: &'a str,
         opts: &'a LogOptions,
     ) -> BoxFuture<'a, MicrosandboxResult<Vec<LogEntry>>> {
-        Box::pin(async move { crate::sandbox::logs::read_logs(self, name, opts) })
+        Box::pin(async move { crate::logs::read_logs(name, opts).await })
     }
 
     fn metrics<'a>(
@@ -1059,7 +1061,10 @@ fn sandbox_config_from_cloud(cloud: &CloudSandbox) -> SandboxConfig {
     let mut config = SandboxConfig {
         // --- Mapped from cloud wire (CloudCreateSandboxRequest) ---
         name: cloud.config.name.clone(),
-        image: RootfsSource::Oci(cloud.config.image.clone()),
+        image: RootfsSource::Oci(OciRootfsSource {
+            reference: cloud.config.image.clone(),
+            upper_size_mib: None,
+        }),
         cpus: cloud.config.vcpus,
         memory_mib: cloud.config.memory_mib,
         env: cloud.config.env.clone().into_iter().collect(),
@@ -1186,7 +1191,7 @@ pub(super) fn cloud_create_request_from_config(
     }
 
     let image = match config.image {
-        RootfsSource::Oci(image) => image,
+        RootfsSource::Oci(image) => image.reference,
         RootfsSource::Bind(_) => {
             return Err(unsupported(
                 "image-from-host-dir",
@@ -1334,7 +1339,10 @@ mod tests {
     fn base_cloud_config() -> SandboxConfig {
         SandboxConfig {
             name: "agent-1".into(),
-            image: RootfsSource::Oci("python:3.12".into()),
+            image: RootfsSource::Oci(OciRootfsSource {
+                reference: "python:3.12".into(),
+                upper_size_mib: None,
+            }),
             ..Default::default()
         }
     }
@@ -1449,7 +1457,7 @@ mod tests {
         let config = sandbox_config_from_cloud(&cloud);
 
         assert_eq!(config.name, "agent-1");
-        assert!(matches!(config.image, RootfsSource::Oci(ref s) if s == "python:3.12"));
+        assert!(matches!(config.image, RootfsSource::Oci(ref s) if s.reference == "python:3.12"));
         assert_eq!(config.cpus, 4);
         assert_eq!(config.memory_mib, 2048);
         assert_eq!(

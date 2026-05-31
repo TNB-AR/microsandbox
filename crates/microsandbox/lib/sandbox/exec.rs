@@ -568,12 +568,8 @@ pub(crate) mod local {
             "exec_stream"
         );
 
-        let id = client.next_id();
-        let rx = client.subscribe(id).await;
-
         let req = build_exec_request(config, cmd, args, cwd, user, &env, &rlimits, tty, 24, 80);
-        let msg = Message::with_payload(MessageType::ExecRequest, id, &req)?;
-        client.send(&msg).await?;
+        let (id, rx) = client.stream(MessageType::ExecRequest, &req).await?;
 
         let stdin = match &stdin_mode {
             StdinMode::Pipe => Some(ExecSink::new(id, Arc::clone(&client))),
@@ -585,13 +581,9 @@ pub(crate) mod local {
             let bridge = Arc::clone(&client);
             tokio::spawn(async move {
                 let payload = ExecStdin { data };
-                if let Ok(msg) = Message::with_payload(MessageType::ExecStdin, id, &payload) {
-                    let _ = bridge.send(&msg).await;
-                }
+                let _ = bridge.send(id, MessageType::ExecStdin, &payload).await;
                 let close = ExecStdin { data: Vec::new() };
-                if let Ok(msg) = Message::with_payload(MessageType::ExecStdin, id, &close) {
-                    let _ = bridge.send(&msg).await;
-                }
+                let _ = bridge.send(id, MessageType::ExecStdin, &close).await;
             });
         }
 

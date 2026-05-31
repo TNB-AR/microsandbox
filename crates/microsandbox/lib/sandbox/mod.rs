@@ -12,7 +12,6 @@ pub mod exec;
 pub mod fs;
 mod handle;
 pub mod init;
-pub mod logs;
 pub(crate) mod metrics;
 mod patch;
 mod types;
@@ -24,7 +23,7 @@ use microsandbox_db::{DbReadConnection, DbWriteConnection};
 use microsandbox_image::Registry;
 use microsandbox_protocol::{
     exec::{ExecRequest, ExecRlimit},
-    message::{Message, MessageType},
+    message::MessageType,
 };
 use sea_orm::{
     ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, Set, sea_query::Expr,
@@ -32,8 +31,8 @@ use sea_orm::{
 use tokio::sync::Mutex;
 
 use microsandbox_image::{
-    Digest, GlobalCache, PullOptions, PullProgressSender, PullResult, Reference, ext4, filetree,
-    progress_channel,
+    Digest, GlobalCache, PullOptions, PullProgressSender, PullResult, Reference, ext4,
+    progress_channel, tree,
 };
 
 use crate::{
@@ -48,10 +47,37 @@ use crate::{
 use self::exec::{ExecHandle, ExecOptions};
 
 //--------------------------------------------------------------------------------------------------
+// Constants
+//--------------------------------------------------------------------------------------------------
+
+/// Maximum UTF-8 byte length for a sandbox name.
+pub const MAX_SANDBOX_NAME_BYTES: usize = microsandbox_metrics::SLOT_NAME_BYTES;
+
+//--------------------------------------------------------------------------------------------------
+// Functions: Validation
+//--------------------------------------------------------------------------------------------------
+
+/// Validate a sandbox name used by CLI and SDK APIs.
+pub fn validate_sandbox_name(name: &str) -> MicrosandboxResult<()> {
+    builder::validate_sandbox_name(name)
+}
+
+/// Validate sandbox-name-derived runtime paths before the sandbox process starts.
+pub(super) fn validate_sandbox_name_for_runtime(name: &str) -> MicrosandboxResult<()> {
+    validate_sandbox_name(name)?;
+    crate::runtime::resolve_sandbox_agent_socket_path(name).map(|_| ())
+}
+
+pub(crate) fn sandbox_name_validation_message(name: &str) -> Option<String> {
+    validate_sandbox_name(name).err().map(|err| err.to_string())
+}
+
+//--------------------------------------------------------------------------------------------------
 // Re-Exports
 //--------------------------------------------------------------------------------------------------
 
 pub use crate::db::entity::sandbox::SandboxStatus;
+pub use crate::logs::{LogEntry, LogOptions, LogSource, LogStreamOptions};
 pub use attach::AttachOptionsBuilder;
 pub use builder::{RegistryConfigBuilder, SandboxBuilder};
 pub use config::SandboxConfig;
@@ -59,7 +85,6 @@ pub use exec::{ExecOptionsBuilder, ExecOutput, Rlimit, RlimitResource};
 pub use fs::{FsEntry, FsEntryKind, FsMetadata, FsReadStream, FsWriteSink, SandboxFs};
 pub use handle::SandboxHandle;
 pub use init::{HandoffInit, InitOptionsBuilder};
-pub use logs::{LogEntry, LogOptions, LogSource};
 pub use metrics::{SandboxMetrics, all_sandbox_metrics};
 pub use microsandbox_image::{PullPolicy, PullProgress, PullProgressHandle};
 #[cfg(feature = "net")]
@@ -70,8 +95,9 @@ pub use microsandbox_network::config::NetworkConfig;
 pub use microsandbox_network::policy::NetworkPolicy;
 pub use microsandbox_runtime::logging::LogLevel;
 pub use types::{
-    DiskImageFormat, ImageBuilder, ImageSource, IntoImage, MountBuilder, Patch, PatchBuilder,
-    RootfsSource, VolumeMount,
+    DiskImageFormat, HostPermissions, ImageBuilder, ImageSource, IntoImage, MountBuilder,
+    MountOptions, OciRootfsSource, Patch, PatchBuilder, RootfsSource, StatVirtualization,
+    VolumeMount,
 };
 
 //--------------------------------------------------------------------------------------------------
@@ -330,7 +356,8 @@ pub(crate) async fn create_local(
     prepare_create_target(db, &config, &sandbox_dir).await?;
 
     // Resolve OCI images before spawning the sandbox process.
-    if let RootfsSource::Oci(reference) = config.image.clone() {
+    if let RootfsSource::Oci(oci) = config.image.clone() {
+        let reference = oci.reference;
         let overrides = RegistryOverrides {
             auth: config.registry_auth.clone(),
             insecure: config.insecure,
@@ -537,13 +564,14 @@ async fn create_inner_local(
     // Wait for the relay socket to become available.
     let client = wait_for_relay(&agent_sock_path, &mut handle, &config.name).await?;
 
-    let ready = client.ready();
-    tracing::info!(
-        boot_time_ms = ready.boot_time_ns / 1_000_000,
-        init_time_ms = ready.init_time_ns / 1_000_000,
-        ready_time_ms = ready.ready_time_ns / 1_000_000,
-        "sandbox ready",
-    );
+    if let Ok(ready) = client.ready() {
+        tracing::info!(
+            boot_time_ms = ready.boot_time_ns / 1_000_000,
+            init_time_ms = ready.init_time_ns / 1_000_000,
+            ready_time_ms = ready.ready_time_ns / 1_000_000,
+            "sandbox ready",
+        );
+    }
     Ok((
         crate::backend::SandboxLocalState {
             db_id: sandbox_id,
@@ -650,13 +678,17 @@ pub(crate) async fn stop_local(
         .join("runtime")
         .join("agent.sock");
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-    match AgentClient::connect(&sock_path, deadline).await {
-        Ok(client) => {
-            let msg = Message::new(MessageType::Shutdown, 0, Vec::new());
-            client.send(&msg).await?;
+    match tokio::time::timeout(
+        deadline.saturating_duration_since(tokio::time::Instant::now()),
+        AgentClient::connect(&sock_path),
+    )
+    .await
+    {
+        Ok(Ok(client)) => {
+            client.send(0, MessageType::Shutdown, &()).await?;
             Ok(())
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             // Graceful degradation: agent UDS unreachable (socket missing,
             // ECONNREFUSED, handshake timeout). Fall back to SIGTERM via PID
             // so we still attempt a stop — at the cost of skipping the
@@ -666,6 +698,20 @@ pub(crate) async fn stop_local(
                 sock = %sock_path.display(),
                 error = %e,
                 "stop_local: agent UDS unreachable; falling back to SIGTERM",
+            );
+            if let Some(pid) = pid.filter(|p| pid_is_alive(*p)) {
+                nix::sys::signal::kill(
+                    nix::unistd::Pid::from_raw(pid),
+                    nix::sys::signal::Signal::SIGTERM,
+                )?;
+            }
+            Ok(())
+        }
+        Err(_) => {
+            tracing::warn!(
+                sandbox = %name,
+                sock = %sock_path.display(),
+                "stop_local: agent UDS timed out; falling back to SIGTERM",
             );
             if let Some(pid) = pid.filter(|p| pid_is_alive(*p)) {
                 nix::sys::signal::kill(
@@ -890,6 +936,26 @@ impl Sandbox {
             .sandboxes()
             .logs(self.backend.clone(), &self.name, opts)
             .await
+    }
+
+    /// Stream log entries for this sandbox.
+    ///
+    /// Local streams the on-disk JSON Lines files produced by the relay tap;
+    /// cloud returns `Unsupported` until cloud logs land.
+    pub async fn log_stream(
+        &self,
+        opts: &LogStreamOptions,
+    ) -> MicrosandboxResult<
+        impl futures::Stream<Item = MicrosandboxResult<LogEntry>> + Send + 'static + use<>,
+    > {
+        if self.local().is_none() {
+            return Err(crate::MicrosandboxError::Unsupported {
+                feature: "Sandbox::log_stream on cloud".into(),
+                available_when: "when cloud logs land".into(),
+            });
+        }
+
+        crate::logs::log_stream(&self.name, opts).await
     }
 
     /// Low-level access to the guest agent client.
@@ -1278,8 +1344,13 @@ async fn wait_for_relay(
 
     loop {
         attempts += 1;
-        match AgentClient::connect(sock_path, deadline).await {
-            Ok(client) => {
+        match tokio::time::timeout(
+            deadline.saturating_duration_since(tokio::time::Instant::now()),
+            AgentClient::connect(sock_path),
+        )
+        .await
+        {
+            Ok(Ok(client)) => {
                 tracing::debug!(attempts, "wait_for_relay: connected");
                 // The relay is up — clear any stale boot-error.json from
                 // a previous failed attempt so it cannot misattribute a
@@ -1289,7 +1360,7 @@ async fn wait_for_relay(
                 }
                 return Ok(client);
             }
-            Err(_) if tokio::time::Instant::now() < deadline => {
+            Ok(Err(_)) | Err(_) if tokio::time::Instant::now() < deadline => {
                 // Check if the sandbox process is still alive before retrying.
                 // If it crashed, there's no point waiting for the socket.
                 if let Some(status) = handle.try_wait()? {
@@ -1329,6 +1400,20 @@ async fn wait_for_relay(
                 tokio::time::sleep(backoff).await;
                 backoff = std::cmp::min(backoff.saturating_mul(2), max_backoff);
             }
+            Ok(Err(e)) => {
+                tracing::debug!(
+                    attempts,
+                    error = %e,
+                    "wait_for_relay: agent connection failed"
+                );
+                if let Some(boot_err) = read_boot_error(log_dir.as_deref()) {
+                    return Err(crate::MicrosandboxError::BootStart {
+                        name: sandbox_name.to_string(),
+                        err: boot_err,
+                    });
+                }
+                return Err(e.into());
+            }
             Err(e) => {
                 tracing::debug!(
                     attempts,
@@ -1347,7 +1432,9 @@ async fn wait_for_relay(
                         err: boot_err,
                     });
                 }
-                return Err(e);
+                return Err(crate::MicrosandboxError::Runtime(format!(
+                    "timed out waiting for agent relay: {e}"
+                )));
             }
         }
     }
@@ -1880,7 +1967,7 @@ async fn prepare_create_target(
             SandboxStatus::Running | SandboxStatus::Draining | SandboxStatus::Paused
         );
         if active {
-            stop_sandbox_for_replacement(pools, &model, config.replace_with_grace).await?;
+            stop_sandbox_for_replacement(pools, &model, config.replace_with_timeout).await?;
         }
 
         sandbox_entity::Entity::delete_by_id(model.id)
@@ -2119,7 +2206,7 @@ async fn replace_oci_manifest_pin<C: ConnectionTrait>(
 /// Create a sparse ext4 image for the writable overlay upper layer.
 async fn create_upper_ext4(
     path: &std::path::Path,
-    tree: Option<filetree::FileTree>,
+    tree: Option<tree::FileTree>,
 ) -> MicrosandboxResult<()> {
     let _ = tokio::fs::remove_file(path).await;
     let ext4_options = ext4::Ext4FormatOptions::default();
@@ -2137,8 +2224,8 @@ async fn create_upper_ext4(
 }
 
 /// Build the ext4 root directory tree that overlayfs expects.
-fn build_overlay_upper_tree(tree: Option<filetree::FileTree>) -> filetree::FileTree {
-    use filetree::{DirectoryNode, FileTree, InodeMetadata, TreeNode};
+fn build_overlay_upper_tree(tree: Option<tree::FileTree>) -> tree::FileTree {
+    use tree::{DirectoryNode, FileTree, InodeMetadata, TreeNode};
 
     let mut overlay_tree = FileTree::new();
     let mut upper_dir = DirectoryNode::new(InodeMetadata::default());
@@ -2176,6 +2263,8 @@ mod tests {
 
     use microsandbox_db::entity::{run as run_entity, sandbox_rootfs as sandbox_rootfs_entity};
     use microsandbox_db::pool::DbPools;
+
+    use crate::sandbox::OciRootfsSource;
     use microsandbox_migration::{Migrator, MigratorTrait};
     use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, Set};
     use tempfile::tempdir;
@@ -2359,7 +2448,10 @@ mod tests {
 
         let mut config = SandboxConfig {
             name: "pinned".into(),
-            image: RootfsSource::Oci("docker.io/library/alpine".into()),
+            image: RootfsSource::Oci(OciRootfsSource {
+                reference: "docker.io/library/alpine".into(),
+                upper_size_mib: None,
+            }),
             ..Default::default()
         };
         config.manifest_digest = Some("sha256:aaaa".into());
@@ -2401,7 +2493,10 @@ mod tests {
 
         let mut config = SandboxConfig {
             name: "recreated".into(),
-            image: RootfsSource::Oci("docker.io/library/alpine".into()),
+            image: RootfsSource::Oci(OciRootfsSource {
+                reference: "docker.io/library/alpine".into(),
+                upper_size_mib: None,
+            }),
             ..Default::default()
         };
         config.manifest_digest = Some("sha256:aaaa".into());
@@ -2442,7 +2537,10 @@ mod tests {
 
         let mut config = SandboxConfig {
             name: "persisted-digest".into(),
-            image: RootfsSource::Oci("docker.io/library/alpine".into()),
+            image: RootfsSource::Oci(OciRootfsSource {
+                reference: "docker.io/library/alpine".into(),
+                upper_size_mib: None,
+            }),
             ..Default::default()
         };
         config.manifest_digest = Some("sha256:abc123".into());
@@ -2684,7 +2782,10 @@ mod tests {
 
         let mut config = SandboxConfig {
             name: "persisted".into(),
-            image: RootfsSource::Oci("docker.io/library/alpine".into()),
+            image: RootfsSource::Oci(OciRootfsSource {
+                reference: "docker.io/library/alpine".into(),
+                upper_size_mib: None,
+            }),
             ..Default::default()
         };
         config.manifest_digest = Some("sha256:aaaa".into());

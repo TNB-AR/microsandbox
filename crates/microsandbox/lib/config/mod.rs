@@ -138,7 +138,7 @@ pub struct LocalConfig {
 pub struct MetricsConfig {
     /// Number of slots reserved in the metrics shared-memory segment.
     /// A value of `0` (the default) falls back to the built-in default at
-    /// read time via [`GlobalConfig::metrics_registry_capacity`]. The
+    /// read time via [`LocalConfig::metrics_registry_capacity`]. The
     /// derived `Default` therefore avoids pinning serialized configs to a
     /// particular release's default capacity.
     pub capacity: u32,
@@ -1161,7 +1161,7 @@ mod tests {
 
     #[test]
     fn test_metrics_capacity_default_uses_crate_default() {
-        let cfg = GlobalConfig::default();
+        let cfg = LocalConfig::default();
         assert_eq!(
             cfg.metrics_registry_capacity(),
             microsandbox_metrics::default_capacity()
@@ -1171,7 +1171,7 @@ mod tests {
     #[test]
     fn test_metrics_capacity_zero_falls_back_to_default() {
         let json = r#"{"metrics": {"capacity": 0}}"#;
-        let cfg: GlobalConfig = serde_json::from_str(json).unwrap();
+        let cfg: LocalConfig = serde_json::from_str(json).unwrap();
         assert_eq!(cfg.metrics.capacity, 0);
         assert_eq!(
             cfg.metrics_registry_capacity(),
@@ -1182,7 +1182,7 @@ mod tests {
     #[test]
     fn test_metrics_capacity_explicit_value_overrides_default() {
         let json = r#"{"metrics": {"capacity": 2048}}"#;
-        let cfg: GlobalConfig = serde_json::from_str(json).unwrap();
+        let cfg: LocalConfig = serde_json::from_str(json).unwrap();
         assert_eq!(cfg.metrics.capacity, 2048);
         assert_eq!(cfg.metrics_registry_capacity(), 2048);
     }

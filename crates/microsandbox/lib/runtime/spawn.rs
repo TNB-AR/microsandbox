@@ -6,10 +6,13 @@
 //! internally.
 
 #[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::{
     collections::HashMap,
     ffi::OsString,
+    fmt::Write,
     path::{Path, PathBuf},
     process::Stdio,
 };
@@ -35,6 +38,12 @@ use crate::{
     runtime::handle::ProcessHandle,
     sandbox::{DiskImageFormat, Rlimit, RootfsSource, SandboxConfig, VolumeMount},
 };
+
+//--------------------------------------------------------------------------------------------------
+// Constants
+//--------------------------------------------------------------------------------------------------
+
+const AGENT_SOCKET_HASH_HEX_LEN: usize = 32;
 
 //--------------------------------------------------------------------------------------------------
 // Types
@@ -119,7 +128,7 @@ pub async fn spawn_sandbox(
     }
 
     // Compute the agent relay socket path.
-    let agent_sock_path = runtime_dir.join("agent.sock");
+    let agent_sock_path = resolve_sandbox_agent_socket_path(&config.name)?;
 
     // Stage file bind mounts: each file gets its own isolated directory so
     // that virtio-fs (which requires directories) can share it without
@@ -221,6 +230,95 @@ pub async fn spawn_sandbox(
 // Functions: Helpers
 //--------------------------------------------------------------------------------------------------
 
+/// Return agent relay socket paths in preferred connection order.
+pub(crate) fn sandbox_agent_socket_path_candidates(name: &str) -> [PathBuf; 2] {
+    [
+        sandbox_agent_socket_path(name),
+        legacy_sandbox_agent_socket_path(name),
+    ]
+}
+
+/// Pick the first socket path usable on this platform.
+pub(crate) fn resolve_sandbox_agent_socket_path(name: &str) -> MicrosandboxResult<PathBuf> {
+    let candidates = sandbox_agent_socket_path_candidates(name);
+    for path in &candidates {
+        if sandbox_agent_socket_path_fits(path) {
+            return Ok(path.clone());
+        }
+    }
+
+    let shortest = candidates
+        .iter()
+        .map(|path| sandbox_agent_socket_path_len(path))
+        .min()
+        .unwrap_or(0);
+    Err(crate::MicrosandboxError::InvalidConfig(format!(
+        "agent relay socket path is too long: shortest derived path is {shortest} bytes, \
+         but Unix socket paths on this platform must be shorter than {} bytes; set \
+         MSB_HOME or paths.sandboxes to a shorter directory",
+        unix_socket_path_capacity()
+    )))
+}
+
+fn sandbox_agent_socket_path(name: &str) -> PathBuf {
+    let mut hasher = Sha256::new();
+    hasher.update(name.as_bytes());
+    let digest = hasher.finalize();
+
+    let mut filename = String::with_capacity(AGENT_SOCKET_HASH_HEX_LEN + ".sock".len());
+    for byte in digest.iter().take(AGENT_SOCKET_HASH_HEX_LEN / 2) {
+        let _ = Write::write_fmt(&mut filename, format_args!("{byte:02x}"));
+    }
+    filename.push_str(".sock");
+
+    let base = crate::backend::default_backend()
+        .as_local()
+        .map(|local| local.config().run_dir())
+        .unwrap_or_else(|| microsandbox_utils::resolve_home().join(microsandbox_utils::RUN_SUBDIR));
+    base.join("agent").join(filename)
+}
+
+fn legacy_sandbox_agent_socket_path(name: &str) -> PathBuf {
+    let base = crate::backend::default_backend()
+        .as_local()
+        .map(|local| local.config().sandboxes_dir())
+        .unwrap_or_else(|| {
+            microsandbox_utils::resolve_home().join(microsandbox_utils::SANDBOXES_SUBDIR)
+        });
+    base.join(name).join("runtime").join("agent.sock")
+}
+
+#[cfg(unix)]
+fn sandbox_agent_socket_path_fits(path: &Path) -> bool {
+    sandbox_agent_socket_path_len(path) < unix_socket_path_capacity()
+}
+
+#[cfg(not(unix))]
+fn sandbox_agent_socket_path_fits(_path: &Path) -> bool {
+    true
+}
+
+#[cfg(unix)]
+fn sandbox_agent_socket_path_len(path: &Path) -> usize {
+    path.as_os_str().as_bytes().len()
+}
+
+#[cfg(not(unix))]
+fn sandbox_agent_socket_path_len(_path: &Path) -> usize {
+    0
+}
+
+#[cfg(unix)]
+fn unix_socket_path_capacity() -> usize {
+    let storage = unsafe { std::mem::zeroed::<libc::sockaddr_un>() };
+    storage.sun_path.len()
+}
+
+#[cfg(not(unix))]
+fn unix_socket_path_capacity() -> usize {
+    usize::MAX
+}
+
 async fn terminate_startup_process(
     child: &mut tokio::process::Child,
 ) -> Option<std::process::ExitStatus> {
@@ -246,8 +344,9 @@ async fn stage_file_mounts(
             VolumeMount::Bind {
                 host,
                 guest,
-                readonly,
-            } if host.is_file() => Some((host, guest, *readonly)),
+                options,
+                ..
+            } if host.is_file() => Some((host, guest, options.readonly)),
             _ => None,
         })
         .collect();
@@ -614,29 +713,39 @@ fn sandbox_cli_args(
             VolumeMount::Bind {
                 host,
                 guest,
-                readonly,
+                options,
+                stat_virtualization: _,
+                host_permissions: _,
             } => {
                 if let Some((file_mount_dir, filename, tag)) = staged_file_mounts.get(guest) {
-                    push_file_mount_arg(&mut args, tag, file_mount_dir, *readonly);
-                    push_file_mounts_spec(&mut file_mounts_val, tag, filename, guest, *readonly);
+                    push_file_mount_arg(&mut args, tag, file_mount_dir, options.readonly);
+                    push_file_mounts_spec(
+                        &mut file_mounts_val,
+                        tag,
+                        filename,
+                        guest,
+                        options.readonly,
+                    );
                 } else {
-                    push_dir_mount_arg(&mut args, guest, &host.display(), *readonly);
-                    push_dir_mounts_spec(&mut dir_mounts_val, guest, *readonly);
+                    push_dir_mount_arg(&mut args, guest, &host.display(), options.readonly);
+                    push_dir_mounts_spec(&mut dir_mounts_val, guest, options.readonly);
                 }
             }
             VolumeMount::Named {
                 name,
                 guest,
-                readonly,
+                options,
+                stat_virtualization: _,
+                host_permissions: _,
             } => {
                 let vol_path = local.volume_path(name);
-                push_dir_mount_arg(&mut args, guest, &vol_path.display(), *readonly);
-                push_dir_mounts_spec(&mut dir_mounts_val, guest, *readonly);
+                push_dir_mount_arg(&mut args, guest, &vol_path.display(), options.readonly);
+                push_dir_mounts_spec(&mut dir_mounts_val, guest, options.readonly);
             }
             VolumeMount::Tmpfs {
                 guest,
                 size_mib,
-                readonly,
+                options,
             } => {
                 if !tmpfs_val.is_empty() {
                     tmpfs_val.push(';');
@@ -645,7 +754,7 @@ fn sandbox_cli_args(
                 if let Some(s) = size_mib {
                     tmpfs_val.push_str(&format!(",size={s}"));
                 }
-                if *readonly {
+                if options.readonly {
                     tmpfs_val.push_str(",ro");
                 }
             }
@@ -654,16 +763,16 @@ fn sandbox_cli_args(
                 guest,
                 format,
                 fstype,
-                readonly,
+                options,
             } => {
                 let id = guest_mount_tag(guest);
-                push_disk_mount_arg(&mut args, &id, &host.display(), format, *readonly);
+                push_disk_mount_arg(&mut args, &id, &host.display(), format, options.readonly);
                 push_disk_mounts_spec(
                     &mut disk_mounts_val,
                     &id,
                     guest,
                     fstype.as_deref(),
-                    *readonly,
+                    options.readonly,
                 );
             }
         }
@@ -789,7 +898,8 @@ mod tests {
         LogLevel,
         backend::LocalBackend,
         sandbox::{
-            DiskImageFormat, Rlimit, RlimitResource, RootfsSource, SandboxBuilder, SandboxConfig,
+            DiskImageFormat, OciRootfsSource, Rlimit, RlimitResource, RootfsSource, SandboxBuilder,
+            SandboxConfig,
         },
     };
 
@@ -1127,7 +1237,10 @@ mod tests {
     async fn test_sandbox_cli_args_apply_default_oci_tmpfs() {
         let mut config = SandboxConfig {
             name: "test".into(),
-            image: RootfsSource::Oci("alpine".into()),
+            image: RootfsSource::Oci(OciRootfsSource {
+                reference: "alpine".into(),
+                upper_size_mib: None,
+            }),
             memory_mib: 1024,
             manifest_digest: Some(
                 "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),

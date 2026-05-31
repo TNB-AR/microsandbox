@@ -1015,7 +1015,7 @@ mod tests {
 
         assert_eq!(
             err.to_string(),
-            "invalid config: sandbox name is too long: 129 bytes (max 128)"
+            "invalid config: sandbox name must be at most 128 characters: got 129"
         );
     }
 

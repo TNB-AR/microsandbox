@@ -10,7 +10,7 @@ use std::{path::Path, sync::Arc};
 
 use bytes::Bytes;
 use microsandbox_protocol::{
-    fs::{FsData, FsEntryInfo, FsResponse},
+    fs::{FsData, FsEntryInfo, FsOpenOptions, FsResponse},
     message::{Message, MessageType},
 };
 use tokio::sync::mpsc;
@@ -31,6 +31,9 @@ pub struct SandboxFs<'a> {
     backend: Arc<dyn Backend>,
     name: &'a str,
 }
+
+/// Agentd-side filesystem handle.
+pub type FsHandle = u64;
 
 /// A filesystem entry returned from listing or stat operations.
 #[derive(Debug, Clone)]
@@ -103,6 +106,7 @@ pub struct FsWriteSink {
     id: u32,
     client: Arc<AgentClient>,
     rx: mpsc::UnboundedReceiver<Message>,
+    close_handle: Option<FsHandle>,
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -358,8 +362,14 @@ impl FsWriteSink {
         id: u32,
         client: Arc<AgentClient>,
         rx: mpsc::UnboundedReceiver<Message>,
+        close_handle: Option<FsHandle>,
     ) -> Self {
-        Self { id, client, rx }
+        Self {
+            id,
+            client,
+            rx,
+            close_handle,
+        }
     }
 
     /// Write a chunk of data.
@@ -367,8 +377,10 @@ impl FsWriteSink {
         let fs_data = FsData {
             data: data.as_ref().to_vec(),
         };
-        let msg = Message::with_payload(MessageType::FsData, self.id, &fs_data)?;
-        self.client.send(&msg).await
+        self.client
+            .send(self.id, MessageType::FsData, &fs_data)
+            .await
+            .map_err(Into::into)
     }
 
     /// Close the write stream (sends EOF) and wait for confirmation.
@@ -377,11 +389,14 @@ impl FsWriteSink {
     /// error if the guest reports a write failure.
     pub async fn close(mut self) -> MicrosandboxResult<()> {
         let eof = FsData { data: Vec::new() };
-        let msg = Message::with_payload(MessageType::FsData, self.id, &eof)?;
-        self.client.send(&msg).await?;
+        self.client.send(self.id, MessageType::FsData, &eof).await?;
 
         // Wait for the terminal FsResponse from the guest.
-        wait_for_ok_response(&mut self.rx).await
+        let result = wait_for_ok_response(&mut self.rx).await;
+        if let Some(handle) = self.close_handle.take() {
+            let _ = local::close_handle(&self.client, handle).await;
+        }
+        result
     }
 }
 
@@ -451,6 +466,22 @@ async fn wait_for_ok_response(rx: &mut mpsc::UnboundedReceiver<Message>) -> Micr
     ))
 }
 
+fn read_only_open_options() -> FsOpenOptions {
+    FsOpenOptions {
+        read: true,
+        ..Default::default()
+    }
+}
+
+fn write_open_options() -> FsOpenOptions {
+    FsOpenOptions {
+        write: true,
+        create: true,
+        truncate: true,
+        ..Default::default()
+    }
+}
+
 //--------------------------------------------------------------------------------------------------
 // Module: local (free fn impls called by LocalBackend's SandboxBackend impl)
 //--------------------------------------------------------------------------------------------------
@@ -468,16 +499,16 @@ pub(crate) mod local {
 
     use bytes::Bytes;
     use microsandbox_protocol::{
-        fs::{FS_CHUNK_SIZE, FsData, FsOp, FsRequest, FsResponse, FsResponseData},
-        message::{Message, MessageType},
+        fs::{FS_CHUNK_SIZE, FsData, FsOp, FsOpenOptions, FsRequest, FsResponse, FsResponseData},
+        message::MessageType,
     };
     use tokio::io::AsyncReadExt;
 
     use crate::{MicrosandboxError, MicrosandboxResult, agent::AgentClient, backend::LocalBackend};
 
     use super::{
-        FsEntry, FsMetadata, FsReadStream, FsWriteSink, check_response, entry_info_to_fs_entry,
-        entry_info_to_metadata, wait_for_ok_response,
+        FsEntry, FsHandle, FsMetadata, FsReadStream, FsWriteSink, check_response,
+        entry_info_to_fs_entry, entry_info_to_metadata, wait_for_ok_response,
     };
 
     /// Open a fresh agent UDS connection for the named sandbox.
@@ -491,7 +522,52 @@ pub(crate) mod local {
             .join("runtime")
             .join("agent.sock");
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-        AgentClient::connect(&sock_path, deadline).await
+        tokio::time::timeout(
+            deadline.saturating_duration_since(tokio::time::Instant::now()),
+            AgentClient::connect(&sock_path),
+        )
+        .await
+        .map_err(|_| {
+            MicrosandboxError::Runtime(format!("timed out connecting to agent for {name:?}"))
+        })?
+        .map_err(Into::into)
+    }
+
+    async fn open_file(
+        client: &AgentClient,
+        path: &str,
+        options: FsOpenOptions,
+    ) -> MicrosandboxResult<FsHandle> {
+        let req = FsRequest {
+            op: FsOp::OpenFile {
+                path: path.to_string(),
+                options,
+            },
+        };
+        let resp_msg = client.request(MessageType::FsRequest, &req).await?;
+        let resp: FsResponse = resp_msg.payload()?;
+        if !resp.ok {
+            return Err(MicrosandboxError::SandboxFs(
+                resp.error.unwrap_or_else(|| "unknown error".into()),
+            ));
+        }
+        match resp.data {
+            Some(FsResponseData::Handle(handle)) => Ok(handle),
+            _ => Err(MicrosandboxError::SandboxFs(
+                "unexpected response data for open".into(),
+            )),
+        }
+    }
+
+    pub(crate) async fn close_handle(
+        client: &AgentClient,
+        handle: FsHandle,
+    ) -> MicrosandboxResult<()> {
+        let req = FsRequest {
+            op: FsOp::CloseHandle { handle },
+        };
+        let resp_msg = client.request(MessageType::FsRequest, &req).await?;
+        check_response(resp_msg)
     }
 
     pub(crate) async fn read(
@@ -500,16 +576,16 @@ pub(crate) mod local {
         path: &str,
     ) -> MicrosandboxResult<Bytes> {
         let client = connect_agent(local, name).await?;
-        let id = client.next_id();
-        let mut rx = client.subscribe(id).await;
+        let handle = open_file(&client, path, super::read_only_open_options()).await?;
 
         let req = FsRequest {
             op: FsOp::Read {
-                path: path.to_string(),
+                handle,
+                offset: 0,
+                len: None,
             },
         };
-        let msg = Message::with_payload(MessageType::FsRequest, id, &req)?;
-        client.send(&msg).await?;
+        let (_id, mut rx) = client.stream(MessageType::FsRequest, &req).await?;
 
         let mut data = Vec::new();
         while let Some(msg) = rx.recv().await {
@@ -531,6 +607,8 @@ pub(crate) mod local {
             }
         }
 
+        let close_result = close_handle(&client, handle).await;
+        close_result?;
         Ok(Bytes::from(data))
     }
 
@@ -540,16 +618,16 @@ pub(crate) mod local {
         path: &str,
     ) -> MicrosandboxResult<FsReadStream> {
         let client = Arc::new(connect_agent(local, name).await?);
-        let id = client.next_id();
-        let rx = client.subscribe(id).await;
+        let handle = open_file(&client, path, super::read_only_open_options()).await?;
 
         let req = FsRequest {
             op: FsOp::Read {
-                path: path.to_string(),
+                handle,
+                offset: 0,
+                len: None,
             },
         };
-        let msg = Message::with_payload(MessageType::FsRequest, id, &req)?;
-        client.send(&msg).await?;
+        let (_id, rx) = client.stream(MessageType::FsRequest, &req).await?;
 
         // Pin the AgentClient alive inside the stream — without it the
         // reader task would drop after this fn returns and `rx` would
@@ -564,31 +642,30 @@ pub(crate) mod local {
         data: Vec<u8>,
     ) -> MicrosandboxResult<()> {
         let client = connect_agent(local, name).await?;
-        let id = client.next_id();
-        let mut rx = client.subscribe(id).await;
+        let handle = open_file(&client, path, super::write_open_options()).await?;
 
         let req = FsRequest {
             op: FsOp::Write {
-                path: path.to_string(),
-                mode: None,
+                handle,
+                offset: 0,
+                len: Some(data.len() as u64),
             },
         };
-        let msg = Message::with_payload(MessageType::FsRequest, id, &req)?;
-        client.send(&msg).await?;
+        let (id, mut rx) = client.stream(MessageType::FsRequest, &req).await?;
 
         for chunk in data.chunks(FS_CHUNK_SIZE) {
             let fs_data = FsData {
                 data: chunk.to_vec(),
             };
-            let msg = Message::with_payload(MessageType::FsData, id, &fs_data)?;
-            client.send(&msg).await?;
+            client.send(id, MessageType::FsData, &fs_data).await?;
         }
 
         let eof = FsData { data: Vec::new() };
-        let msg = Message::with_payload(MessageType::FsData, id, &eof)?;
-        client.send(&msg).await?;
+        client.send(id, MessageType::FsData, &eof).await?;
 
-        wait_for_ok_response(&mut rx).await
+        let result = wait_for_ok_response(&mut rx).await;
+        let _ = close_handle(&client, handle).await;
+        result
     }
 
     pub(crate) async fn write_stream(
@@ -597,19 +674,18 @@ pub(crate) mod local {
         path: &str,
     ) -> MicrosandboxResult<FsWriteSink> {
         let client = Arc::new(connect_agent(local, name).await?);
-        let id = client.next_id();
-        let rx = client.subscribe(id).await;
+        let handle = open_file(&client, path, super::write_open_options()).await?;
 
         let req = FsRequest {
             op: FsOp::Write {
-                path: path.to_string(),
-                mode: None,
+                handle,
+                offset: 0,
+                len: None,
             },
         };
-        let msg = Message::with_payload(MessageType::FsRequest, id, &req)?;
-        client.send(&msg).await?;
+        let (id, rx) = client.stream(MessageType::FsRequest, &req).await?;
 
-        Ok(FsWriteSink::new(id, client, rx))
+        Ok(FsWriteSink::new(id, client, rx, Some(handle)))
     }
 
     pub(crate) async fn list(
@@ -623,8 +699,7 @@ pub(crate) mod local {
                 path: path.to_string(),
             },
         };
-        let msg = Message::with_payload(MessageType::FsRequest, 0, &req)?;
-        let resp_msg = client.request(msg).await?;
+        let resp_msg = client.request(MessageType::FsRequest, &req).await?;
         let resp: FsResponse = resp_msg.payload()?;
 
         if !resp.ok {
@@ -650,10 +725,10 @@ pub(crate) mod local {
         let req = FsRequest {
             op: FsOp::Mkdir {
                 path: path.to_string(),
+                mode: None,
             },
         };
-        let msg = Message::with_payload(MessageType::FsRequest, 0, &req)?;
-        let resp_msg = client.request(msg).await?;
+        let resp_msg = client.request(MessageType::FsRequest, &req).await?;
         check_response(resp_msg)
     }
 
@@ -667,6 +742,7 @@ pub(crate) mod local {
         let op = if recursive {
             FsOp::RemoveDir {
                 path: path.to_string(),
+                recursive,
             }
         } else {
             FsOp::Remove {
@@ -674,8 +750,7 @@ pub(crate) mod local {
             }
         };
         let req = FsRequest { op };
-        let msg = Message::with_payload(MessageType::FsRequest, 0, &req)?;
-        let resp_msg = client.request(msg).await?;
+        let resp_msg = client.request(MessageType::FsRequest, &req).await?;
         check_response(resp_msg)
     }
 
@@ -692,8 +767,7 @@ pub(crate) mod local {
                 dst: to.to_string(),
             },
         };
-        let msg = Message::with_payload(MessageType::FsRequest, 0, &req)?;
-        let resp_msg = client.request(msg).await?;
+        let resp_msg = client.request(MessageType::FsRequest, &req).await?;
         check_response(resp_msg)
     }
 
@@ -710,8 +784,7 @@ pub(crate) mod local {
                 dst: to.to_string(),
             },
         };
-        let msg = Message::with_payload(MessageType::FsRequest, 0, &req)?;
-        let resp_msg = client.request(msg).await?;
+        let resp_msg = client.request(MessageType::FsRequest, &req).await?;
         check_response(resp_msg)
     }
 
@@ -724,10 +797,10 @@ pub(crate) mod local {
         let req = FsRequest {
             op: FsOp::Stat {
                 path: path.to_string(),
+                follow_symlink: true,
             },
         };
-        let msg = Message::with_payload(MessageType::FsRequest, 0, &req)?;
-        let resp_msg = client.request(msg).await?;
+        let resp_msg = client.request(MessageType::FsRequest, &req).await?;
         let resp: FsResponse = resp_msg.payload()?;
 
         if !resp.ok {

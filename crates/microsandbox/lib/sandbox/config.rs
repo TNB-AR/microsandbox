@@ -285,13 +285,7 @@ impl SandboxConfig {
             && let RootfsSource::Oci(oci) = &mut self.image
             && oci.upper_size_mib.is_none()
         {
-            oci.upper_size_mib = Some(
-                crate::config::config()
-                    .sandbox_defaults
-                    .oci
-                    .upper_size_mib
-                    .unwrap_or(DEFAULT_OCI_UPPER_SIZE_MIB),
-            );
+            oci.upper_size_mib = Some(DEFAULT_OCI_UPPER_SIZE_MIB);
         }
     }
 

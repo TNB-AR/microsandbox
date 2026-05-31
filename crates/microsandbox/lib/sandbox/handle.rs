@@ -208,15 +208,17 @@ impl SandboxHandle {
     ///
     /// Same backing data as [`Sandbox::logs`](super::Sandbox::logs).
     /// Works without starting the sandbox. **Local handles only**.
-    pub fn logs(&self, opts: &super::LogOptions) -> MicrosandboxResult<Vec<super::LogEntry>> {
-        let local_backend =
-            self.backend
-                .as_local()
-                .ok_or_else(|| crate::MicrosandboxError::Unsupported {
-                    feature: "SandboxHandle::logs on cloud".into(),
-                    available_when: "when cloud logs land".into(),
-                })?;
-        super::logs::read_logs(local_backend, &self.name, opts)
+    pub async fn logs(
+        &self,
+        opts: &crate::logs::LogOptions,
+    ) -> MicrosandboxResult<Vec<crate::logs::LogEntry>> {
+        if self.backend.as_local().is_none() {
+            return Err(crate::MicrosandboxError::Unsupported {
+                feature: "SandboxHandle::logs on cloud".into(),
+                available_when: "when cloud logs land".into(),
+            });
+        }
+        crate::logs::read_logs(&self.name, opts).await
     }
 
     /// Get the latest metrics snapshot for this sandbox. **Local handles only**.
@@ -248,12 +250,7 @@ impl SandboxHandle {
                     available_when: "when cloud metrics land".into(),
                 })?;
         let db = local_backend.db().await?.read();
-        super::metrics::metrics_for_sandbox(
-            db,
-            local.db_id,
-            u64::from(config.memory_mib) * 1024 * 1024,
-        )
-        .await
+        super::metrics::metrics_for_sandbox(db, local_backend, local.db_id, &config).await
     }
 
     /// Start this sandbox and return a live handle.
@@ -313,7 +310,17 @@ impl SandboxHandle {
         // respond within 10s, something is wedged and the caller should
         // see a timeout instead of hanging forever.
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-        let client = AgentClient::connect(&sock_path, deadline).await?;
+        let client = tokio::time::timeout(
+            deadline.saturating_duration_since(tokio::time::Instant::now()),
+            AgentClient::connect(&sock_path),
+        )
+        .await
+        .map_err(|_| {
+            crate::MicrosandboxError::Runtime(format!(
+                "timed out connecting to sandbox '{}' agent",
+                self.name
+            ))
+        })??;
         let config: SandboxConfig = serde_json::from_str(&local.config_json)?;
 
         Ok(Sandbox::from_local(

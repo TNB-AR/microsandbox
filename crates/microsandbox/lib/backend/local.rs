@@ -471,7 +471,7 @@ mod tests {
     use sea_orm::{ConnectionTrait, Database, DatabaseBackend, Statement};
 
     use super::*;
-    use crate::backend::{VolumeBackend, with_backend};
+    use crate::backend::with_backend;
     use crate::volume::VolumeConfig;
 
     #[tokio::test]
@@ -508,7 +508,6 @@ mod tests {
             "manifest_layer",
             "run",
             "sandbox",
-            "sandbox_metric",
             "sandbox_rootfs",
             "snapshot_index",
             "volume",
@@ -706,6 +705,7 @@ mod tests {
             sandbox_defaults: crate::config::SandboxDefaults {
                 cpus: 4,
                 memory_mib: 2048,
+                oci: crate::config::OciSandboxDefaults::default(),
                 shell: "/bin/zsh".into(),
                 workdir: Some("/work".into()),
                 metrics_sample_interval_ms: NonZero::new(750),

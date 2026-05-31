@@ -223,7 +223,7 @@ pub(crate) mod local {
 
     use microsandbox_protocol::{
         exec::{ExecExited, ExecResize, ExecStdin, ExecStdout},
-        message::{Message, MessageType},
+        message::MessageType,
     };
     use tokio::io::{AsyncWriteExt, unix::AsyncFd};
 
@@ -256,9 +256,6 @@ pub(crate) mod local {
 
         let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
 
-        let id = client.next_id();
-        let mut rx = client.subscribe(id).await;
-
         let req = build_exec_request(
             config,
             cmd,
@@ -271,8 +268,7 @@ pub(crate) mod local {
             rows,
             cols,
         );
-        let msg = Message::with_payload(MessageType::ExecRequest, id, &req)?;
-        client.send(&msg).await?;
+        let (id, mut rx) = client.stream(MessageType::ExecRequest, &req).await?;
 
         crossterm::terminal::enable_raw_mode()
             .map_err(|e| crate::MicrosandboxError::Terminal(e.to_string()))?;
@@ -334,9 +330,7 @@ pub(crate) mod local {
                             }
 
                             let payload = ExecStdin { data: data.to_vec() };
-                            if let Ok(msg) = Message::with_payload(MessageType::ExecStdin, id, &payload) {
-                                let _ = client.send(&msg).await;
-                            }
+                            let _ = client.send(id, MessageType::ExecStdin, &payload).await;
                         }
                         Ok(Err(e)) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                         Ok(Err(_)) => break,
@@ -409,9 +403,7 @@ pub(crate) mod local {
                 _ = sigwinch.recv() => {
                     if let Ok((new_cols, new_rows)) = crossterm::terminal::size() {
                         let payload = ExecResize { rows: new_rows, cols: new_cols };
-                        if let Ok(msg) = Message::with_payload(MessageType::ExecResize, id, &payload) {
-                            let _ = client.send(&msg).await;
-                        }
+                        let _ = client.send(id, MessageType::ExecResize, &payload).await;
                     }
                 }
             }
