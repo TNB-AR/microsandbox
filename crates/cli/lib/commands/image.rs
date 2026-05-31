@@ -562,8 +562,9 @@ pub async fn run_inspect(args: ImageInspectArgs) -> anyhow::Result<()> {
 
 /// Execute `msb image load` / `msb load`.
 pub async fn run_load(args: ImageLoadArgs) -> anyhow::Result<()> {
-    let global = microsandbox::config::config();
-    let cache_dir = global.cache_dir();
+    let backend = crate::commands::common::resolve_local_backend()?;
+    let local = crate::commands::common::local_backend_ref(&backend)?;
+    let cache_dir = local.cache_dir();
     let temp_input;
     let input_path = if let Some(path) = args.input.as_ref() {
         path
@@ -586,7 +587,7 @@ pub async fn run_load(args: ImageLoadArgs) -> anyhow::Result<()> {
     .await?;
 
     for image in &loaded {
-        Image::persist(&image.reference, image.metadata.clone()).await?;
+        Image::persist(local, &image.reference, image.metadata.clone()).await?;
     }
 
     if !args.quiet {
@@ -605,8 +606,9 @@ pub async fn run_load(args: ImageLoadArgs) -> anyhow::Result<()> {
 
 /// Execute `msb image save` / `msb save`.
 pub async fn run_save(args: ImageSaveArgs) -> anyhow::Result<()> {
-    let global = microsandbox::config::config();
-    let cache_dir = global.cache_dir();
+    let backend = crate::commands::common::resolve_local_backend()?;
+    let local = crate::commands::common::local_backend_ref(&backend)?;
+    let cache_dir = local.cache_dir();
     let cache = microsandbox_image::GlobalCache::new(&cache_dir)?;
     let mut requests = Vec::with_capacity(args.references.len());
 

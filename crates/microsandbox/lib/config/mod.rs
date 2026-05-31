@@ -1065,9 +1065,9 @@ fn remove_registry_keyring_auth(hostname: &str) -> Result<(), String> {
 fn keyring_unavailable_message(hostname: &str) -> String {
     #[cfg(not(feature = "keyring"))]
     {
-        return format!(
+        format!(
             "secure OS credential storage is disabled; enable the `keyring` feature to use it for `{hostname}`"
-        );
+        )
     }
 
     #[cfg(all(
