@@ -18,7 +18,6 @@ pub mod install;
 pub mod list;
 pub mod logs;
 pub mod metrics;
-pub mod profile;
 pub mod ps;
 pub mod pull;
 pub mod registry;

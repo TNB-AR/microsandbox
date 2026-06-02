@@ -53,7 +53,7 @@ pub struct Profile {
     /// Which backend this profile selects.
     pub backend: ProfileBackend,
 
-    /// Cloud-only: the msb-cloud endpoint URL.
+    /// Cloud-only: the API endpoint URL.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
 
@@ -72,9 +72,9 @@ pub struct Profile {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ProfileBackend {
-    /// Local libkrun + agentd backend on the calling host.
+    /// Local runtime backend on the calling host.
     Local,
-    /// Remote msb-cloud control plane.
+    /// Remote cloud control plane.
     Cloud,
 }
 
