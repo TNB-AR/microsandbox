@@ -458,7 +458,7 @@ pub fn smoltcp_poll_loop(
                     shared.clone(),
                     tls_state.clone(),
                     network_policy.clone(),
-                    conn.upstream_connected,
+                    conn.proxy_connect,
                 );
                 continue;
             }
@@ -467,9 +467,9 @@ pub fn smoltcp_poll_loop(
                 // "upstream-unreachable" failure mode — even an
                 // upstream DNS failure yields SERVFAIL responses
                 // rather than a silently-closed connection. Mark the
-                // connection as upstream-connected so normal task exit
+                // connection as connected so normal task exit
                 // produces FIN, not RST.
-                conn.upstream_connected.store(true, Ordering::Release);
+                conn.proxy_connect.mark_connected();
 
                 // DNS over TCP: route through the same forwarder the UDP
                 // path uses. The forwarder applies the domain block list
@@ -494,7 +494,7 @@ pub fn smoltcp_poll_loop(
                 && let Some(ref tls_state) = tls_state
             {
                 // Same "always upstream-connected" reasoning as plain DNS over TCP.
-                conn.upstream_connected.store(true, Ordering::Release);
+                conn.proxy_connect.mark_connected();
 
                 // DNS over TLS: terminate TLS at the gateway with a
                 // per-domain cert, hand the inner DNS frames to the
@@ -522,7 +522,7 @@ pub fn smoltcp_poll_loop(
                 conn.to_smoltcp,
                 shared.clone(),
                 network_policy.clone(),
-                conn.upstream_connected,
+                conn.proxy_connect,
             );
         }
 

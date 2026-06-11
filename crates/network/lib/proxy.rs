@@ -8,7 +8,6 @@
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -16,6 +15,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
+use crate::conn::ProxyConnectState;
 use crate::policy::{EgressEvaluation, HostnameSource, NetworkPolicy, Protocol};
 use crate::shared::SharedState;
 use crate::tls::sni;
@@ -45,10 +45,9 @@ const PEEK_BUDGET: Duration = Duration::from_secs(5);
 /// dials; for host-alias connections it's loopback (gateway rewritten).
 /// For everything else the two are identical.
 ///
-/// `upstream_connected` is flipped to `true` after the upstream
-/// `TcpStream::connect` succeeds. The connection tracker reads this
-/// on proxy exit to decide between FIN (clean close) and RST
-/// (upstream never reached, e.g. connect failure or policy denial).
+/// `proxy_connect` is updated before the task exits so the connection
+/// tracker can decide between FIN (clean close) and RST (upstream
+/// connect failure).
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_tcp_proxy(
     handle: &tokio::runtime::Handle,
@@ -58,7 +57,7 @@ pub fn spawn_tcp_proxy(
     to_smoltcp: mpsc::Sender<Bytes>,
     shared: Arc<SharedState>,
     network_policy: Arc<NetworkPolicy>,
-    upstream_connected: Arc<AtomicBool>,
+    proxy_connect: Arc<ProxyConnectState>,
 ) {
     handle.spawn(async move {
         if let Err(e) = tcp_proxy_task(
@@ -68,7 +67,7 @@ pub fn spawn_tcp_proxy(
             to_smoltcp,
             shared,
             network_policy,
-            upstream_connected,
+            proxy_connect,
         )
         .await
         {
@@ -86,7 +85,7 @@ async fn tcp_proxy_task(
     to_smoltcp: mpsc::Sender<Bytes>,
     shared: Arc<SharedState>,
     network_policy: Arc<NetworkPolicy>,
-    upstream_connected: Arc<AtomicBool>,
+    proxy_connect: Arc<ProxyConnectState>,
 ) -> io::Result<()> {
     // Peek only when there's a Domain/DomainSuffix rule that could
     // need an SNI to refine. Otherwise the SYN handler's decision is
@@ -116,17 +115,30 @@ async fn tcp_proxy_task(
                     source = source.label(),
                     "TCP egress denied by domain policy",
                 );
+                proxy_connect.mark_policy_denied();
+                shared.proxy_wake.wake();
                 return Ok(());
             }
             EgressEvaluation::DeferUntilHostname => {
                 debug_assert!(false, "DeferUntilHostname leaked into TCP proxy task");
+                proxy_connect.mark_policy_denied();
+                shared.proxy_wake.wake();
                 return Ok(());
             }
         }
     }
 
-    let stream = TcpStream::connect(connect_dst).await?;
-    upstream_connected.store(true, Ordering::Release);
+    let stream = match TcpStream::connect(connect_dst).await {
+        Ok(stream) => {
+            proxy_connect.mark_connected();
+            stream
+        }
+        Err(e) => {
+            proxy_connect.mark_upstream_connect_failed();
+            shared.proxy_wake.wake();
+            return Err(e);
+        }
+    };
     let (mut server_rx, mut server_tx) = stream.into_split();
 
     // Replay the buffered first flight before relay starts.
