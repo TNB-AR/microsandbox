@@ -95,11 +95,12 @@ async fn tcp_proxy_task(
     secrets: Arc<SecretsConfig>,
     upstream_connected: Arc<AtomicBool>,
 ) -> io::Result<()> {
-    // Peek when:
-    // - there are Domain/DomainSuffix rules that need SNI to refine egress, OR
-    // - secrets are configured (we need the Host header for plain-HTTP substitution)
-    let needs_peek = network_policy.has_domain_rules() || !secrets.secrets.is_empty();
-    let (mut initial_buf, sni) = if needs_peek {
+    // Pre-connect peek is only for domain policy: the hostname has to be known
+    // before we dial upstream so a Deny never opens a connection. Secrets do
+    // *not* gate the connect, so they no longer force a peek here — that work is
+    // deferred to `classify_first_flight` after the socket is open, where it can
+    // run without stalling server-first protocols (see below).
+    let (initial_buf, sni) = if network_policy.has_domain_rules() {
         peek_for_sni(&mut from_smoltcp, PEEK_BUF_SIZE, PEEK_BUDGET).await
     } else {
         (Vec::new(), None)
@@ -133,15 +134,34 @@ async fn tcp_proxy_task(
         }
     }
 
-    let is_tls = initial_buf.first() == Some(&0x16);
+    // Connect upstream *before* finishing the secrets-side classification. A
+    // server-first protocol (SSH, SMTP, a database) sends nothing until it has
+    // seen the server's banner; with the socket already open we can relay that
+    // banner while we wait, instead of burning the peek budget pre-connect.
+    let stream = TcpStream::connect(connect_dst).await?;
+    upstream_connected.store(true, Ordering::Release);
+    let (mut server_rx, mut server_tx) = stream.into_split();
 
-    // For plain-HTTP connections with secrets, peek_for_sni bails on the first
-    // non-TLS byte and may return before headers are complete. Keep reading until
-    // \r\n\r\n so extract_http_host always sees a full header block.
-    if !is_tls && secrets.has_plain_http_candidates() {
-        initial_buf =
-            peek_for_http_headers(initial_buf, &mut from_smoltcp, PEEK_BUF_SIZE, PEEK_BUDGET).await;
-    }
+    // Finish classifying the first flight (TLS vs plain HTTP) and, for
+    // plain-HTTP candidates, gather a full header block — without blocking the
+    // server→guest direction. When domain rules already peeked, `initial_buf`
+    // is reused and this is cheap; with no secrets it is skipped entirely
+    // (`is_tls` only matters for deciding whether to build the handler).
+    let (initial_buf, is_tls) = if !secrets.secrets.is_empty() {
+        classify_first_flight(
+            initial_buf,
+            &mut from_smoltcp,
+            &mut server_rx,
+            &to_smoltcp,
+            &shared,
+            secrets.has_plain_http_candidates(),
+            PEEK_BUF_SIZE,
+            PEEK_BUDGET,
+        )
+        .await?
+    } else {
+        (initial_buf, false)
+    };
 
     let mut secrets_handler: Option<SecretsHandler> = if !secrets.secrets.is_empty() && !is_tls {
         Some(match extract_http_host(&initial_buf) {
@@ -151,10 +171,6 @@ async fn tcp_proxy_task(
     } else {
         None
     };
-
-    let stream = TcpStream::connect(connect_dst).await?;
-    upstream_connected.store(true, Ordering::Release);
-    let (mut server_rx, mut server_tx) = stream.into_split();
 
     // Replay the buffered first flight — run through secrets handler first.
     if !initial_buf.is_empty() {
@@ -285,40 +301,85 @@ fn extract_http_host(buf: &[u8]) -> Option<String> {
         .filter(|h| !h.is_empty())
 }
 
-/// Buffer chunks from `rx` into `buf` until `\r\n\r\n` is seen, the cap is
-/// reached, or the budget expires.
-async fn peek_for_http_headers(
+/// Finish classifying the guest's first flight after the upstream socket is
+/// open, returning the (possibly extended) first-flight buffer and whether it
+/// is a TLS record.
+///
+/// `buf` carries whatever a pre-connect domain-rule peek already captured; when
+/// it is non-empty the TLS/plain decision is already settled and only header
+/// top-up runs. `want_headers` is set when at least one secret can be
+/// substituted over plain HTTP (`SecretsConfig::has_plain_http_candidates`); it
+/// makes the peek keep reading a non-TLS flight until `\r\n\r\n` so
+/// [`extract_http_host`] sees a complete header block.
+///
+/// Crucially, this relays server→guest while it waits. Server-first protocols
+/// (SSH, SMTP, databases) send nothing until they have seen the server's
+/// banner; draining the server side here lets the banner reach the guest
+/// immediately, so the guest's eventual first flight — not a 5s timeout — is
+/// what ends the peek.
+#[allow(clippy::too_many_arguments)]
+async fn classify_first_flight(
     mut buf: Vec<u8>,
-    rx: &mut mpsc::Receiver<Bytes>,
+    from_smoltcp: &mut mpsc::Receiver<Bytes>,
+    server_rx: &mut tokio::net::tcp::OwnedReadHalf,
+    to_smoltcp: &mpsc::Sender<Bytes>,
+    shared: &SharedState,
+    want_headers: bool,
     max: usize,
     budget: Duration,
-) -> Vec<u8> {
-    if buf.windows(4).any(|w| w == b"\r\n\r\n") {
-        return buf;
-    }
+) -> io::Result<(Vec<u8>, bool)> {
+    let mut server_buf = vec![0u8; SERVER_READ_BUF_SIZE];
     let timeout_fut = tokio::time::sleep(budget);
     tokio::pin!(timeout_fut);
+
     loop {
-        tokio::select! {
-            biased;
-            _ = &mut timeout_fut => break,
-            data = rx.recv() => {
-                match data {
-                    Some(bytes) => {
-                        buf.extend_from_slice(&bytes);
-                        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
-                            break;
-                        }
-                        if buf.len() >= max {
-                            break;
-                        }
-                    }
-                    None => break,
-                }
+        // Stop as soon as the protocol class is known and — for plain-HTTP
+        // candidates — a full header block has arrived.
+        if !buf.is_empty() {
+            let is_tls = buf.first() == Some(&0x16);
+            let done = !want_headers
+                || is_tls
+                || buf.len() >= max
+                || buf.windows(4).any(|w| w == b"\r\n\r\n");
+            if done {
+                return Ok((buf, is_tls));
             }
         }
+
+        tokio::select! {
+            biased;
+            _ = &mut timeout_fut => {
+                let is_tls = buf.first() == Some(&0x16);
+                return Ok((buf, is_tls));
+            }
+            // Guest → buffer (not forwarded here; the caller replays it once the
+            // handler is built, so substitution applies to the first flight too).
+            guest = from_smoltcp.recv() => match guest {
+                Some(bytes) => buf.extend_from_slice(&bytes),
+                None => {
+                    let is_tls = buf.first() == Some(&0x16);
+                    return Ok((buf, is_tls));
+                }
+            },
+            // Server → guest: relay immediately so a server-first banner is never
+            // held hostage by the peek.
+            server = server_rx.read(&mut server_buf) => match server {
+                Ok(0) => {
+                    let is_tls = buf.first() == Some(&0x16);
+                    return Ok((buf, is_tls));
+                }
+                Ok(n) => {
+                    let data = Bytes::copy_from_slice(&server_buf[..n]);
+                    if to_smoltcp.send(data).await.is_err() {
+                        let is_tls = buf.first() == Some(&0x16);
+                        return Ok((buf, is_tls));
+                    }
+                    shared.proxy_wake.wake();
+                }
+                Err(e) => return Err(e),
+            },
+        }
     }
-    buf
 }
 
 /// Buffer the first flight until SNI can be extracted, or until one
@@ -854,7 +915,7 @@ mod tests {
 
     #[tokio::test]
     async fn plain_http_substitutes_placeholder_when_host_arrives_in_second_segment() {
-        // Host header split across TCP segments — peek_for_http_headers must keep
+        // Host header split across TCP segments — classify_first_flight must keep
         // reading until \r\n\r\n before extract_http_host is called.
         let (addr, sink) = spawn_sink().await;
         let secrets = make_plain_http_secret("$MSB_KEY", "real-secret-value", false);
